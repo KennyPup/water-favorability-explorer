@@ -1,6 +1,5 @@
 /**
- * Build script – mirrors GRACE app pattern.
- * Bundles server (ESM→CJS) then builds Vite client.
+ * Build script – bundles server (ESM→CJS) then builds Vite client.
  */
 import { execSync } from "child_process";
 import * as fs from "fs";
@@ -15,6 +14,10 @@ execSync(
     --platform=node \
     --format=cjs \
     --outfile=dist/index.cjs \
+    --external:vite \
+    --external:lightningcss \
+    --external:esbuild \
+    --external:tsx \
     --external:better-sqlite3`,
   { stdio: "inherit", cwd: root }
 );
