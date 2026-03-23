@@ -49,9 +49,9 @@ const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
   projectCode: z.string().min(2).max(4).regex(/^[A-Za-z]+$/, "Letters only"),
   resolution:  z.enum(["30m", "90m", "1km"]),
-  wGeology:    z.coerce.number().positive(),
-  wSoil:       z.coerce.number().positive(),
-  wTca:        z.coerce.number().positive(),
+  wGeology:    z.coerce.number().positive("Must be a positive number"),
+  wSoil:       z.coerce.number().positive("Must be a positive number"),
+  wTca:        z.coerce.number().positive("Must be a positive number"),
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -90,7 +90,7 @@ export default function HFExplorer() {
 
   // UI state
   const [rectStep,    setRectStep]    = useState<0|1>(0);
-  const [geoOpacity,  setGeoOpacity]  = useState(40);
+  const [geoOpacity,  setGeoOpacity]  = useState(0);
   const [hfOpacity,   setHfOpacity]   = useState(70);
   const [aoi, setAoi]   = useState<{ minLat:number; maxLat:number; minLon:number; maxLon:number }|null>(null);
   const [running,     setRunning]     = useState(false);
@@ -207,7 +207,7 @@ export default function HFExplorer() {
       if (macroLayerRef.current) { leafletMap.current.removeLayer(macroLayerRef.current); macroLayerRef.current = null; }
     } else {
       if (!macroLayerRef.current) {
-        macroLayerRef.current = L.tileLayer("https://tiles.macrostrat.org/cartodb/{z}/{x}/{y}.png", {
+        macroLayerRef.current = L.tileLayer("https://tiles.macrostrat.org/carto/{z}/{x}/{y}.png", {
           opacity: geoOpacity / 100, maxZoom: 19,
           attribution: 'Geology © <a href="https://macrostrat.org">Macrostrat</a>',
         }).addTo(leafletMap.current);
@@ -397,7 +397,7 @@ export default function HFExplorer() {
               {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
                 <div key={k}>
                   <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="number" step="0.1" min="0.01" error={errors[k]?.message} {...register(k)} />
+                  <FInput id={k} type="number" step="any" min="0" error={errors[k]?.message} {...register(k, { valueAsNumber: true })} />
                 </div>
               ))}
             </div>
@@ -429,7 +429,7 @@ export default function HFExplorer() {
                 style={{ width: 70, accentColor: "#a78bfa", cursor: "pointer" }}
                 title={`Geology opacity: ${geoOpacity}%`}
               />
-              <span className="text-[10px] text-white/60 w-7 text-right">{geoOpacity}%</span>
+              <span className="text-[10px] w-7 text-right" style={{ color: geoOpacity > 0 ? "#a78bfa" : "rgba(255,255,255,0.4)" }}>{geoOpacity > 0 ? `${geoOpacity}%` : "off"}</span>
             </div>
 
             {/* HF raster slider – only show after a successful run */}
