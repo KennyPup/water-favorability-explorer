@@ -1,6 +1,5 @@
 /**
  * Shared TypeScript types between server and client.
- * Mirror the JSON shapes emitted by routes.ts.
  */
 
 export interface HfAoi {
@@ -41,6 +40,20 @@ export interface HfOutputFiles {
   zipPath:       string;
 }
 
+/** Per-layer download URL map returned by /api/hf/run */
+export interface HfLayerUrls {
+  hf:       string;
+  geology:  string;
+  soil:     string;
+  tca_raw:  string;
+  tca_norm: string;
+  rrz:      string;
+  nrz:      string;
+  dem:      string;
+  weights:  string;
+  metadata: string;
+}
+
 export interface HfRunResponse {
   status: "ok" | "error";
   error?: string;
@@ -49,12 +62,9 @@ export interface HfRunResponse {
   utmCrs?:                string;
   estimatedPixels?:       number;
   estimatedOutputSizeMB?: number;
-  outputs?: HfOutputFiles;
-}
-
-export interface HfStatusResponse {
-  status: "ready";
-  outputsDir: string;
-  zips:     string[];
-  projects: string[];
+  /** AOI echoed back from server for map overlay positioning */
+  aoi?: { minLat: number; maxLat: number; minLon: number; maxLon: number };
+  outputs?:   HfOutputFiles;
+  layerUrls?: HfLayerUrls;
+  previewUrl?: string;
 }

@@ -7,13 +7,11 @@ numpy>=1.24.0
 pyproj>=3.5.0
 scipy>=1.10.0
 
-# DEM flow routing (choose one or both; pysheds is easiest to install)
-# pysheds is a pure-Python D8/D∞ flow routing library
+# Image export for HF map preview overlay
+Pillow>=10.0.0
+
+# DEM flow routing (pysheds is pure-Python D8, easiest to install)
 pysheds>=0.4.0
 
-# WhiteboxTools Python wrapper (optional, heavier but more complete)
+# WhiteboxTools Python wrapper (optional, heavier)
 # whitebox>=2.3.0
-
-# For Copernicus DEM download (Phase 2 / real DEM implementation)
-# requests>=2.31.0
-# boto3>=1.28.0   # if using AWS S3 direct tile download
