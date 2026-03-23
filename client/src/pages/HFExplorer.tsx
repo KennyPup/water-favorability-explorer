@@ -25,7 +25,16 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, shadowUrl: markerShadow });
 
-// ─── Layout ──────────────────────────────────────────────────────────────────
+// ─── Geocode (Nominatim) ─────────────────────────────────────────────────────
+async function geocode(query: string): Promise<{ lat: number; lon: number } | null> {
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
+  const res = await fetch(url, { headers: { "Accept-Language": "en", "User-Agent": "WaterFavorabilityExplorer/1.0" } });
+  const data = await res.json();
+  if (!data?.length) return null;
+  return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+}
+
+// ─── Layout ───────────────────────────────────────────────────────────────────
 const LEFT_W  = 268;
 const RIGHT_W = 272;
 const HDR_H   = 46;
@@ -47,7 +56,7 @@ const LAYER_LABELS: Array<{ key: keyof HfLayerUrls; label: string; ext: string }
 // ─── Form schema ──────────────────────────────────────────────────────────────
 const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
-  projectCode: z.string().min(2).max(4).regex(/^[A-Za-z]+$/, "Letters only"),
+  projectCode: z.string().min(2).max(3).regex(/^[A-Za-z]+$/, "2–3 letters"),
   resolution:  z.enum(["30m", "90m", "1km"]),
   wGeology:    z.coerce.number().positive("Must be a positive number"),
   wSoil:       z.coerce.number().positive("Must be a positive number"),
@@ -87,12 +96,17 @@ export default function HFExplorer() {
   const macroLayerRef    = useRef<L.TileLayer | null>(null);
   const hfOverlayRef     = useRef<L.ImageOverlay | null>(null);
   const rectStepRef      = useRef<0|1>(0);
+  const geoOpacityRef    = useRef(0);
+  const geoPopupRef      = useRef<L.Popup | null>(null);
 
   // UI state
   const [rectStep,    setRectStep]    = useState<0|1>(0);
   const [geoOpacity,  setGeoOpacity]  = useState(0);
   const [hfOpacity,   setHfOpacity]   = useState(70);
   const [aoi, setAoi]   = useState<{ minLat:number; maxLat:number; minLon:number; maxLon:number }|null>(null);
+  const [searchText,   setSearchText]   = useState("");
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError,   setSearchError]   = useState<string|null>(null);
   const [running,     setRunning]     = useState(false);
   const [runStatus,   setRunStatus]   = useState<"idle"|"running"|"ok"|"err">("idle");
   const [result,      setResult]      = useState<HfRunResponse|null>(null);
@@ -102,7 +116,7 @@ export default function HFExplorer() {
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { projectName: "HF Run", projectCode: "HF1", resolution: "90m", wGeology: 1, wSoil: 1, wTca: 1 },
+    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: 1, wSoil: 1, wTca: 1 },
   });
 
   useEffect(() => {
@@ -136,6 +150,25 @@ export default function HFExplorer() {
       { attribution: 'Tiles &copy; <a href="https://www.esri.com">Esri</a>', maxZoom: 19 }
     ).addTo(map);
 
+    // Scale bar (metric + imperial)
+    L.control.scale({ position: "bottomright", imperial: true, metric: true }).addTo(map);
+
+    // North arrow – custom Leaflet control, top-right
+    const NorthArrow = L.Control.extend({
+      onAdd() {
+        const div = L.DomUtil.create("div", "");
+        div.style.cssText = "pointer-events:none;user-select:none;";
+        div.innerHTML = `
+          <svg width="32" height="44" viewBox="0 0 32 44" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 1px 3px rgba(0,0,0,0.55))">
+            <polygon points="16,2 23,22 16,18 9,22" fill="#e6edf3" stroke="#161b22" stroke-width="1"/>
+            <polygon points="16,34 23,22 16,18 9,22" fill="#484f58" stroke="#161b22" stroke-width="1"/>
+            <text x="16" y="43" text-anchor="middle" font-size="10" font-weight="700" font-family="sans-serif" fill="#e6edf3" stroke="#161b22" stroke-width="2.5" paint-order="stroke">N</text>
+          </svg>`;
+        return div;
+      },
+    });
+    new NorthArrow({ position: "topright" }).addTo(map);
+
     aoiLayerRef.current = L.featureGroup().addTo(map);
 
     // Mouse-move: live rect preview
@@ -156,9 +189,71 @@ export default function HFExplorer() {
       }
     });
 
-    // Click: first/second corner
+    // Click: geology popup when overlay active, otherwise draw AOI
     map.on("click", (e: L.LeafletMouseEvent) => {
       const { lat, lng } = e.latlng;
+
+      // ── Geology lookup ──────────────────────────────────────────────────
+      if (geoOpacityRef.current > 0 && rectStepRef.current === 0) {
+        if (geoPopupRef.current) { geoPopupRef.current.remove(); geoPopupRef.current = null; }
+        const loadingPopup = L.popup({ className: "geo-id-popup", offset: [0, -8], closeButton: true, autoClose: false, closeOnClick: false })
+          .setLatLng([lat, lng])
+          .setContent(`<div class="geo-popup-loading"><span class="geo-spinner"></span>Looking up geology…</div>`)
+          .addTo(map);
+        geoPopupRef.current = loadingPopup;
+        fetch(`https://macrostrat.org/api/v2/geologic_units/map?lat=${lat}&lng=${lng}`)
+          .then(r => r.json())
+          .then(data => {
+            if (!geoPopupRef.current || geoPopupRef.current !== loadingPopup) return;
+            const unit = data?.success?.data?.[0];
+            if (!unit) {
+              loadingPopup.setContent(`<div class="geo-popup-body"><span style="color:#8b949e;font-size:11px">No geology data at this location</span></div>`);
+              return;
+            }
+            const name    = unit.name || unit.strat_name || "Unknown unit";
+            const ageName = unit.best_int_name || "";
+            const ageRange = (unit.t_age != null && unit.b_age != null)
+              ? `${Number(unit.t_age).toFixed(1)}–${Number(unit.b_age).toFixed(1)} Ma`
+              : "";
+            const age  = ageRange ? `${ageName ? ageName + ", " : ""}${ageRange}` : ageName;
+            const lith = unit.lith || "";
+            const color = unit.color || "#a78bfa";
+            // Map Macrostrat lith keywords → our GEOLOGY_PERM_LUT keys
+            const PERM_MAP: Record<string, number> = {
+              "unconsolidated": 0.95, "alluvium": 0.95, "sand": 0.95, "gravel": 0.95,
+              "siliciclastic": 0.85, "sandstone": 0.85, "conglomerate": 0.85,
+              "pyroclastic": 0.75, "tuff": 0.75,
+              "carbonate": 0.80, "limestone": 0.80, "dolomite": 0.80,
+              "evaporite": 0.45, "gypsum": 0.45, "salt": 0.45,
+              "metamorphic": 0.20, "schist": 0.20, "gneiss": 0.20,
+              "granite": 0.15, "plutonic": 0.15, "acid plutonic": 0.15,
+              "basalt": 0.20, "gabbro": 0.20, "basic plutonic": 0.20,
+              "rhyolite": 0.35, "acid volcanic": 0.35,
+              "andesite": 0.30, "basic volcanic": 0.30,
+            };
+            const lithLow = (lith || "").toLowerCase();
+            let perm = 0.40;
+            for (const [k, v] of Object.entries(PERM_MAP)) {
+              if (lithLow.includes(k)) { perm = v; break; }
+            }
+            const permPct = Math.round(perm * 100);
+            const permColor = perm >= 0.70 ? "#4ade80" : perm >= 0.45 ? "#facc15" : "#f87171";
+            loadingPopup.setContent(`
+              <div class="geo-popup-body">
+                <div class="geo-popup-swatch" style="background:${color}"></div>
+                <div class="geo-popup-name">${name}</div>
+                ${age  ? `<div class="geo-popup-row"><span class="geo-popup-label">Age</span>${age}</div>` : ""}
+                ${lith ? `<div class="geo-popup-row"><span class="geo-popup-label">Lithology</span>${lith}</div>` : ""}
+                <div class="geo-popup-row"><span class="geo-popup-label">HF perm.</span><span style="color:${permColor};font-weight:700">${permPct}%</span><span style="font-size:10px;color:#6e7681;margin-left:4px">(${perm.toFixed(2)})</span></div>
+              </div>`);
+          })
+          .catch(() => {
+            if (geoPopupRef.current === loadingPopup)
+              loadingPopup.setContent(`<div class="geo-popup-body"><span style="color:#f87171;font-size:11px">Geology lookup failed</span></div>`);
+          });
+        return; // don't start AOI draw while geology mode is active
+      }
+
       if (rectStepRef.current === 0) {
         corner1Ref.current  = e.latlng;
         rectStepRef.current = 1;
@@ -200,11 +295,21 @@ export default function HFExplorer() {
     };
   }, [cancelRect]);
 
+  // Keep ref in sync so map click handler can read it without stale closure
+  useEffect(() => { geoOpacityRef.current = geoOpacity; }, [geoOpacity]);
+
+  // Crosshair cursor when geology overlay is visible
+  useEffect(() => {
+    if (!leafletMap.current) return;
+    leafletMap.current.getContainer().style.cursor = geoOpacity > 0 ? "crosshair" : "";
+  }, [geoOpacity]);
+
   // ── Macrostrat geology overlay ────────────────────────────────────────────
   useEffect(() => {
     if (!leafletMap.current) return;
     if (geoOpacity === 0) {
       if (macroLayerRef.current) { leafletMap.current.removeLayer(macroLayerRef.current); macroLayerRef.current = null; }
+      if (geoPopupRef.current)   { geoPopupRef.current.remove(); geoPopupRef.current = null; }
     } else {
       if (!macroLayerRef.current) {
         macroLayerRef.current = L.tileLayer("https://tiles.macrostrat.org/carto/{z}/{x}/{y}.png", {
@@ -258,6 +363,26 @@ export default function HFExplorer() {
       setHfLoading(false);
     }
   }, [hfOpacity]);
+
+  // ── Geocode search ──────────────────────────────────────────────────────────
+  const handleSearch = useCallback(async () => {
+    const q = searchText.trim();
+    if (!q) return;
+    setSearchLoading(true);
+    setSearchError(null);
+    try {
+      const result = await geocode(q);
+      if (!result) { setSearchError("Location not found"); return; }
+      const { lat, lon } = result;
+      if (leafletMap.current) {
+        leafletMap.current.setView([lat, lon], 6, { animate: true });
+      }
+    } catch {
+      setSearchError("Search failed — check your connection");
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [searchText]);
 
   // ── Run HF pipeline ───────────────────────────────────────────────────────
   async function onSubmit(values: FormValues) {
@@ -330,6 +455,28 @@ export default function HFExplorer() {
 
   // ─────────────────────────────────────────────────────────────────────────
   return (
+    <>
+    <style>{`
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .search-input::placeholder { color: #8b949e; }
+      .search-input:focus { outline: none; border-color: #22d3ee !important; }
+      .geo-id-popup .leaflet-popup-content-wrapper {
+        background: #161b22; border: 1px solid #a78bfa60;
+        border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        padding: 0; min-width: 220px; max-width: 300px;
+      }
+      .geo-id-popup .leaflet-popup-content { margin: 0; }
+      .geo-id-popup .leaflet-popup-tip-container .leaflet-popup-tip { background: #161b22; }
+      .geo-id-popup .leaflet-popup-close-button { color: #6e7681 !important; font-size: 16px !important; top: 6px !important; right: 8px !important; }
+      .geo-id-popup .leaflet-popup-close-button:hover { color: #e6edf3 !important; }
+      .geo-popup-loading { display: flex; align-items: center; gap: 8px; padding: 12px 14px; font-size: 11px; color: #8b949e; }
+      .geo-spinner { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #30363d; border-top-color: #a78bfa; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+      .geo-popup-body { padding: 12px 14px 10px; }
+      .geo-popup-swatch { width: 100%; height: 6px; border-radius: 3px; margin-bottom: 8px; opacity: 0.85; }
+      .geo-popup-name { font-size: 12px; font-weight: 700; color: #e6edf3; margin-bottom: 6px; line-height: 1.3; }
+      .geo-popup-row { display: flex; align-items: baseline; gap: 6px; font-size: 11px; color: #c9d1d9; margin-bottom: 3px; line-height: 1.4; }
+      .geo-popup-label { font-size: 10px; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.07em; flex-shrink: 0; min-width: 54px; }
+    `}</style>
     <div className="flex flex-col bg-background text-foreground" style={{ height: "100dvh", overflow: "hidden" }}>
 
       {/* ── Header ─────────────────────────────────────────────────────── */}
@@ -342,6 +489,38 @@ export default function HFExplorer() {
           <span className="font-semibold text-sm">Water Favorability Explorer</span>
           <Pill v="blue">HF v1</Pill>
         </div>
+        {/* Search box – identical pattern to GRACE app */}
+        <div className="flex items-center gap-1.5">
+          <div className="relative flex items-center">
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" className="absolute left-2 pointer-events-none">
+              <circle cx="6.5" cy="6.5" r="4.5" stroke="#8b949e" strokeWidth="1.4"/>
+              <path d="M10 10l3 3" stroke="#8b949e" strokeWidth="1.4" strokeLinecap="round"/>
+            </svg>
+            <input
+              type="text"
+              placeholder="Search city or country…"
+              value={searchText}
+              onChange={(e) => { setSearchText(e.target.value); setSearchError(null); }}
+              onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+              className="search-input"
+              style={{ paddingLeft: 26, paddingRight: 8, height: 28, width: 190,
+                background: "#0d1117", border: "1px solid #30363d",
+                borderRadius: 6, fontSize: 12, color: "#e6edf3" }}
+            />
+          </div>
+          <button
+            onClick={handleSearch}
+            disabled={searchLoading || !searchText.trim()}
+            style={{ height: 28, padding: "0 10px", fontSize: 12, fontWeight: 600,
+              background: "#0e4c5a", border: "1px solid #22d3ee", borderRadius: 6,
+              color: "#22d3ee", cursor: searchLoading || !searchText.trim() ? "not-allowed" : "pointer",
+              opacity: searchLoading || !searchText.trim() ? 0.5 : 1 }}
+          >
+            {searchLoading ? "…" : "Go"}
+          </button>
+          {searchError && <span className="text-[11px] text-red-400">{searchError}</span>}
+        </div>
+
         <div className="text-[11px] text-muted-foreground">
           {rectStep === 1
             ? <span className="text-amber-400">Click second corner · Esc to cancel</span>
@@ -366,8 +545,8 @@ export default function HFExplorer() {
                 <FInput id="projectName" placeholder="e.g. Shabelle HF" error={errors.projectName?.message} {...register("projectName")} />
               </div>
               <div>
-                <Label htmlFor="projectCode">Code (2–4 letters)</Label>
-                <FInput id="projectCode" placeholder="SHB" maxLength={4} className="uppercase" error={errors.projectCode?.message}
+                <Label htmlFor="projectCode">Code (2–3 letters)</Label>
+                <FInput id="projectCode" placeholder="SHB" maxLength={3} className="uppercase" error={errors.projectCode?.message}
                   {...register("projectCode", { setValueAs: (v: string) => v.toUpperCase() })} />
               </div>
             </div>
@@ -397,7 +576,7 @@ export default function HFExplorer() {
               {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
                 <div key={k}>
                   <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="number" step="any" min="0" error={errors[k]?.message} {...register(k, { valueAsNumber: true })} />
+                  <FInput id={k} type="number" step="any" min="0" error={errors[k]?.message} {...register(k)} />
                 </div>
               ))}
             </div>
@@ -575,5 +754,6 @@ export default function HFExplorer() {
         </div>
       </div>
     </div>
+    </>
   );
 }
