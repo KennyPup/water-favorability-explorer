@@ -1,0 +1,8 @@
+{
+  "_comment": "Configure paths to real geology/soil rasters here. Leave empty strings to use synthetic layers.",
+  "_geology_note": "Recommended: GLIM (Global Lithological Map) or WHYMAP hydrogeology. Expect integer class rasters with codes matching GEOLOGY_PERM_LUT in run_hf.py.",
+  "_soil_note": "Recommended: HWSD v1.2 or iSDA-Africa soil texture. Expect integer class rasters.",
+
+  "geology": "",
+  "soil": ""
+}

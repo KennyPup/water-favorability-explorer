@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: water-favorability-explorer
+    runtime: node
+    buildCommand: |
+      pip install -r python/requirements.txt &&
+      npm install &&
+      npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    disk:
+      name: outputs
+      mountPath: /data/outputs
+      sizeGB: 10

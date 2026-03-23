@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background:       222 25% 8%;
+    --foreground:       210 20% 92%;
+    --card:             222 22% 12%;
+    --card-foreground:  210 20% 92%;
+    --border:           217 18% 22%;
+    --input:            217 18% 18%;
+    --primary:          152 55% 28%;
+    --primary-foreground: 0 0% 98%;
+    --secondary:        217 18% 20%;
+    --secondary-foreground: 210 20% 85%;
+    --muted:            217 18% 20%;
+    --muted-foreground: 215 12% 55%;
+    --accent:           152 40% 20%;
+    --accent-foreground: 210 20% 92%;
+    --destructive:      0 65% 45%;
+    --destructive-foreground: 0 0% 98%;
+    --ring:             152 55% 30%;
+
+    --font-sans: "Inter", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", "Courier New", monospace;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(var(--background)); }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
+
+/* HF score color stops (used in result panel) */
+.hf-bar-high   { background: #1a7a4a; }
+.hf-bar-medium { background: #6abf69; }
+.hf-bar-low    { background: #f4a261; }
+.hf-bar-vlow   { background: #d9534f; }
