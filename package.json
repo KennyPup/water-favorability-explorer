@@ -31,9 +31,7 @@
     "tailwindcss-animate": "^1.0.7",
     "wouter": "^3.3.5",
     "zod": "^3.24.2",
-    "zod-validation-error": "^3.4.0"
-  },
-  "devDependencies": {
+    "zod-validation-error": "^3.4.0",
     "@tailwindcss/typography": "^0.5.15",
     "@types/express": "^5.0.0",
     "@types/node": "20.19.27",
@@ -47,5 +45,6 @@
     "tsx": "^4.20.5",
     "typescript": "5.6.3",
     "vite": "^7.3.0"
-  }
+  },
+  "devDependencies": {}
 }
