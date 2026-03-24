@@ -62,9 +62,9 @@ const HfRunSchema = z.object({
   resolution: z.enum(["30m", "90m", "1km"]),
   weights: z
     .object({
-      geology: z.number().positive().optional(),
-      soil:    z.number().positive().optional(),
-      tca:     z.number().positive().optional(),
+      geology: z.coerce.number().positive().optional(),
+      soil:    z.coerce.number().positive().optional(),
+      tca:     z.coerce.number().positive().optional(),
     })
     .optional(),
 });

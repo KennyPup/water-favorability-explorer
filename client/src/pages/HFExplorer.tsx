@@ -59,9 +59,9 @@ const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
   projectCode: z.string().min(2).max(3).regex(/^[A-Za-z]+$/, "2–3 letters"),
   resolution:  z.enum(["30m", "90m", "1km"]),
-  wGeology:    z.coerce.number().positive("Must be a positive number"),
-  wSoil:       z.coerce.number().positive("Must be a positive number"),
-  wTca:        z.coerce.number().positive("Must be a positive number"),
+  wGeology:    z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
+  wSoil:       z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
+  wTca:        z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -120,7 +120,7 @@ export default function HFExplorer() {
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: 1, wSoil: 1, wTca: 1 },
+    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: 1.0, wSoil: 1.0, wTca: 1.0 },
   });
 
   useEffect(() => {
@@ -618,7 +618,7 @@ export default function HFExplorer() {
               {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
                 <div key={k}>
                   <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="number" step="any" min="0" error={errors[k]?.message} {...register(k)} />
+                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message} {...register(k)} />
                 </div>
               ))}
             </div>
