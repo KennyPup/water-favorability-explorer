@@ -91,14 +91,28 @@ type FormValues = z.infer<typeof formSchema>;
 function Label({ htmlFor, children }: { htmlFor: string; children: React.ReactNode }) {
   return <label htmlFor={htmlFor} className="block text-[11px] font-medium text-muted-foreground mb-0.5">{children}</label>;
 }
-function FInput({ id, error, className, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { id: string; error?: string }) {
-  return (
-    <div>
-      <input id={id} className={cn("w-full rounded border bg-input px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring", error ? "border-destructive" : "border-border", className)} {...p} />
-      {error && <p className="mt-0.5 text-[10px] text-destructive">{error}</p>}
-    </div>
-  );
-}
+// FInput must forward the ref so React Hook Form can attach its ref to the
+// actual <input> element. Without forwardRef the RHF ref lands on the <div>
+// wrapper and the field value is never read, causing permanent "Required".
+const FInput = React.forwardRef<
+  HTMLInputElement,
+  React.InputHTMLAttributes<HTMLInputElement> & { id: string; error?: string }
+>(({ id, error, className, ...p }, ref) => (
+  <div>
+    <input
+      ref={ref}
+      id={id}
+      className={cn(
+        "w-full rounded border bg-input px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring",
+        error ? "border-destructive" : "border-border",
+        className,
+      )}
+      {...p}
+    />
+    {error && <p className="mt-0.5 text-[10px] text-destructive">{error}</p>}
+  </div>
+));
+FInput.displayName = "FInput";
 function SecHead({ children }: { children: React.ReactNode }) {
   return <h3 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-1.5 mt-3.5 first:mt-0 border-b border-border pb-0.5">{children}</h3>;
 }
@@ -444,6 +458,7 @@ export default function HFExplorer() {
 
   // ── Run HF pipeline ───────────────────────────────────────────────────────
   async function onSubmit(values: FormValues) {
+    console.log("[HF] Form submitted – values:", values);
     if (!aoi) { toast({ title: "No AOI", description: "Draw a rectangle on the map first.", variant: "destructive" }); return; }
     setRunning(true);
     setRunStatus("running");
@@ -646,7 +661,8 @@ export default function HFExplorer() {
               {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
                 <div key={k}>
                   <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message} {...register(k)} />
+                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message}
+                    {...register(k, { valueAsNumber: true })} />
                 </div>
               ))}
             </div>
