@@ -27,8 +27,9 @@ L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, 
 
 // ─── Geocode (Nominatim) ─────────────────────────────────────────────────────
 async function geocode(query: string): Promise<{ lat: number; lon: number } | null> {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1`;
-  const res = await fetch(url, { headers: { "Accept-Language": "en", "User-Agent": "WaterFavorabilityExplorer/1.0" } });
+  // No custom User-Agent – browsers block CORS preflights on Nominatim with custom headers
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&accept-language=en`;
+  const res = await fetch(url);
   const data = await res.json();
   if (!data?.length) return null;
   return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
@@ -210,14 +211,12 @@ export default function HFExplorer() {
               loadingPopup.setContent(`<div class="geo-popup-body"><span style="color:#8b949e;font-size:11px">No geology data at this location</span></div>`);
               return;
             }
-            const name    = unit.name || unit.strat_name || "Unknown unit";
             const ageName = unit.best_int_name || "";
             const ageRange = (unit.t_age != null && unit.b_age != null)
               ? `${Number(unit.t_age).toFixed(1)}–${Number(unit.b_age).toFixed(1)} Ma`
               : "";
             const age  = ageRange ? `${ageName ? ageName + ", " : ""}${ageRange}` : ageName;
             const lith = unit.lith || "";
-            const color = unit.color || "#a78bfa";
             // Map Macrostrat lith keywords → our GEOLOGY_PERM_LUT keys
             const PERM_MAP: Record<string, number> = {
               "unconsolidated": 0.95, "alluvium": 0.95, "sand": 0.95, "gravel": 0.95,
@@ -236,15 +235,12 @@ export default function HFExplorer() {
             for (const [k, v] of Object.entries(PERM_MAP)) {
               if (lithLow.includes(k)) { perm = v; break; }
             }
-            const permPct = Math.round(perm * 100);
             const permColor = perm >= 0.70 ? "#4ade80" : perm >= 0.45 ? "#facc15" : "#f87171";
             loadingPopup.setContent(`
               <div class="geo-popup-body">
-                <div class="geo-popup-swatch" style="background:${color}"></div>
-                <div class="geo-popup-name">${name}</div>
                 ${age  ? `<div class="geo-popup-row"><span class="geo-popup-label">Age</span>${age}</div>` : ""}
                 ${lith ? `<div class="geo-popup-row"><span class="geo-popup-label">Lithology</span>${lith}</div>` : ""}
-                <div class="geo-popup-row"><span class="geo-popup-label">HF perm.</span><span style="color:${permColor};font-weight:700">${permPct}%</span><span style="font-size:10px;color:#6e7681;margin-left:4px">(${perm.toFixed(2)})</span></div>
+                <div class="geo-popup-row"><span class="geo-popup-label">Perm.</span><span style="color:${permColor};font-weight:700;font-family:monospace">${perm.toFixed(2)}</span></div>
               </div>`);
           })
           .catch(() => {
@@ -472,8 +468,6 @@ export default function HFExplorer() {
       .geo-popup-loading { display: flex; align-items: center; gap: 8px; padding: 12px 14px; font-size: 11px; color: #8b949e; }
       .geo-spinner { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #30363d; border-top-color: #a78bfa; animation: spin 0.8s linear infinite; flex-shrink: 0; }
       .geo-popup-body { padding: 12px 14px 10px; }
-      .geo-popup-swatch { width: 100%; height: 6px; border-radius: 3px; margin-bottom: 8px; opacity: 0.85; }
-      .geo-popup-name { font-size: 12px; font-weight: 700; color: #e6edf3; margin-bottom: 6px; line-height: 1.3; }
       .geo-popup-row { display: flex; align-items: baseline; gap: 6px; font-size: 11px; color: #c9d1d9; margin-bottom: 3px; line-height: 1.4; }
       .geo-popup-label { font-size: 10px; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.07em; flex-shrink: 0; min-width: 54px; }
     `}</style>
