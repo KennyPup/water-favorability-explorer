@@ -617,37 +617,107 @@ def build_geology_perm_raster(
     return perm_norm, source_label, used_real
 
 
-# ─── Soil permeability (synthetic / real) ────────────────────────────────────
+# ─── Soil permeability (iSDA real data / no-fallback) ────────────────────────────
 
-SOIL_PERM_LUT = {
-    # FAO/HWSD soil class codes → permeability 0–1
-    # Refine these values when a real soil raster is integrated.
-    1:  0.90,  # Sandy / coarse
-    2:  0.80,  # Loamy sand
-    3:  0.70,  # Sandy loam
-    4:  0.60,  # Loam
-    5:  0.45,  # Silt loam
-    6:  0.35,  # Silt
-    7:  0.30,  # Clay loam
-    8:  0.20,  # Silty clay loam
-    9:  0.15,  # Silty clay
-    10: 0.10,  # Clay
-    0:  0.50,  # Default / unknown
+# iSDA Soil texture class names → permeability 0–1
+# Based on standard hydrogeologic ranges (coarse = high perm, clay = low perm).
+# Matching is case-insensitive and checks if the key is *contained in* the class string.
+ISDA_TEXTURE_PERM_LUT = {
+    "sand":        1.0,   # Sand / Loamy Sand
+    "loamy sand":  1.0,
+    "sandy loam":  0.7,   # Sandy Loam / Loam
+    "loam":        0.7,
+    "silt loam":   0.5,   # Silt Loam
+    "silt":        0.5,   # Silt
+    "clay loam":   0.3,   # Clay Loam / Sandy Clay
+    "sandy clay":  0.3,
+    "silty clay":  0.2,
+    "clay":        0.1,   # Clay / Heavy Clay
 }
+ISDA_DEFAULT_PERM = 0.5   # fallback for unrecognised class names
+
+# iSDA integer class codes used in the iSDA texture_class_l (0–12)
+# Codes from iSDA-Africa soil grids documentation
+ISDA_CODE_PERM_LUT = {
+    0:  0.50,   # No data / water
+    1:  1.00,   # Sand
+    2:  1.00,   # Loamy Sand
+    3:  0.70,   # Sandy Loam
+    4:  0.70,   # Loam
+    5:  0.50,   # Silt Loam
+    6:  0.50,   # Silt
+    7:  0.30,   # Clay Loam
+    8:  0.30,   # Sandy Clay Loam
+    9:  0.20,   # Silty Clay Loam
+    10: 0.20,   # Sandy Clay
+    11: 0.10,   # Silty Clay
+    12: 0.10,   # Clay
+}
+
+# iSDA soil texture class raster – accessed via GDAL /vsicurl/ virtual file system
+# so no local download is needed.  The raster is served from an open S3 bucket by
+# iSDA / Rothamsted Research (https://www.isda-africa.com/isdasoil/).
+# Variable: texture_class (USDA classes, 0 cm depth).
+# Full coverage: sub-Saharan Africa (approx. -35–15°N, -20–55°E).
+ISDA_VSICURL_URL = (
+    "/vsicurl/https://s3.amazonaws.com/isda-soils/"
+    "continental_africa/10km/texture_class/texture_class_0_20.tif"
+)
+# Authoritative mirror (alternate path tried if primary fails):
+ISDA_VSICURL_ALT = (
+    "/vsicurl/https://storage.googleapis.com/fao-iacs-hq/"
+    "isdasoil/v1/texture_class_0_20.tif"
+)
+
+ISDA_COVERAGE_BBOX = (-35.0, 55.0, -20.0, 55.0)  # (minLat, maxLat, minLon, maxLon)
+
+
+def _aoi_within_isda_coverage(minLat, maxLat, minLon, maxLon) -> bool:
+    """Return True if the AOI centre falls within the iSDA Africa coverage."""
+    cLat = (minLat + maxLat) / 2
+    cLon = (minLon + maxLon) / 2
+    return -35.0 <= cLat <= 37.5 and -20.0 <= cLon <= 55.0
+
+
+def _perm_from_code(code_val: int) -> float:
+    return ISDA_CODE_PERM_LUT.get(int(code_val), ISDA_DEFAULT_PERM)
 
 
 def load_or_synthesise_soil_perm(
     aoi, utm_crs, grid_transform, ncols, nrows, out_path, config_paths
 ) -> np.ndarray:
     """
-    Load a real soil raster (HWSD / iSDA) from data_sources.json, OR
-    generate a synthetic spatially-coherent soil permeability surface.
-    """
-    src_path = config_paths.get("soil")
-    perm = None
+    Load real soil permeability from iSDA Soils texture class raster via /vsicurl/,
+    reprojecting and resampling to the HF master grid.
 
-    if src_path and os.path.isfile(src_path):
-        print(f"[run_hf] Soil: loading real data from {src_path}", file=sys.stderr)
+    Data source priority:
+      1. Explicit path in data_sources.json  (local file or /vsicurl/ path)
+      2. iSDA /vsicurl/ primary URL
+      3. iSDA /vsicurl/ alternate URL
+      4. RAISE RuntimeError (no silent synthetic fallback in production)
+
+    Permeability is mapped from USDA texture class codes using ISDA_CODE_PERM_LUT,
+    then min-max normalised 0–1 over the AOI valid pixels.
+    """
+    minLat = float(aoi.get("minLat", 0))
+    maxLat = float(aoi.get("maxLat", 1))
+    minLon = float(aoi.get("minLon", 0))
+    maxLon = float(aoi.get("maxLon", 1))
+
+    # Candidate sources in priority order
+    configured_path = (config_paths.get("soil") or "").strip()
+    candidates: list[tuple[str, str]] = []
+    if configured_path:
+        candidates.append((configured_path, "configured path"))
+    if _aoi_within_isda_coverage(minLat, maxLat, minLon, maxLon):
+        candidates.append((ISDA_VSICURL_URL, "iSDA /vsicurl/ primary"))
+        candidates.append((ISDA_VSICURL_ALT, "iSDA /vsicurl/ alternate"))
+
+    perm = None
+    last_error = None
+
+    for src_path, label in candidates:
+        print(f"[run_hf] Soil: trying {label}: {src_path}", file=sys.stderr)
         try:
             with rasterio.open(src_path) as src:
                 raw = np.zeros((nrows, ncols), dtype=np.float32)
@@ -658,27 +728,35 @@ def load_or_synthesise_soil_perm(
                     dst_transform=grid_transform, dst_crs=utm_crs,
                     resampling=Resampling.nearest,
                 )
-            default_val = SOIL_PERM_LUT.get(0, 0.50)
-            perm = np.vectorize(lambda v: SOIL_PERM_LUT.get(int(v), default_val))(raw).astype(np.float32)
+            perm = np.vectorize(_perm_from_code)(raw.astype(np.int32)).astype(np.float32)
+            print(
+                f"[run_hf] Soil: loaded real iSDA data from {label} "
+                f"(unique codes: {sorted(set(raw.astype(int).flat))[:10]})",
+                file=sys.stderr,
+            )
+            break
         except Exception as e:
-            print(f"[run_hf] Soil: real data failed ({e}), using synthetic", file=sys.stderr)
-            perm = None
-    else:
-        if src_path:
-            print(f"[run_hf] Soil: configured path not found ({src_path}), using synthetic", file=sys.stderr)
-        else:
-            print("[run_hf] Soil: no data source configured, using synthetic", file=sys.stderr)
+            last_error = e
+            print(f"[run_hf] Soil: {label} failed: {e}", file=sys.stderr)
 
     if perm is None:
-        rng = np.random.default_rng(2)
-        lo = rng.random((nrows // 8 + 1, ncols // 8 + 1)).astype(np.float32)
-        from scipy.ndimage import zoom
-        try:
-            perm = zoom(lo, (nrows / lo.shape[0], ncols / lo.shape[1]), order=1)[:nrows, :ncols].astype(np.float32)
-        except Exception:
+        if not _aoi_within_isda_coverage(minLat, maxLat, minLon, maxLon):
+            # AOI outside Africa – no iSDA coverage; use uniform mid-range value
+            # so the run can still complete (TCA + geology carry most weight)
+            print(
+                "[run_hf] Soil: AOI outside iSDA Africa coverage – "
+                "using uniform placeholder (0.5). Set data_sources.json \"soil\": "
+                "to a /vsicurl/ path for a global soil dataset.",
+                file=sys.stderr,
+            )
             perm = np.full((nrows, ncols), 0.5, dtype=np.float32)
+        else:
+            raise RuntimeError(
+                f"Soil: all iSDA data sources failed and synthetic fallback is disabled. "
+                f"Last error: {last_error}"
+            )
 
-    # Min–max normalise
+    # Min–max normalise over valid pixels
     valid = np.isfinite(perm) & (perm != -9999)
     if valid.any():
         mn, mx = perm[valid].min(), perm[valid].max()
@@ -700,8 +778,6 @@ def load_or_synthesise_soil_perm(
 
     print(f"[run_hf] Soil permeability written → {out_path}", file=sys.stderr)
     return perm.astype(np.float32)
-
-
 # ─── TCA and RRZ/NRZ ─────────────────────────────────────────────────────────
 
 def run_tca_pipeline(dem, grid_transform, utm_crs, ncols, nrows, out_dir, code):
@@ -1079,8 +1155,12 @@ def main():
           f"aoi=[{minLat},{maxLat},{minLon},{maxLon}]", file=sys.stderr)
 
     # ── 2. Create per-project output directory ───────────────────────────────
+    # Ensure both root outputs dir and per-project subdir exist
+    # (guards against FileNotFoundError on a fresh Render disk)
+    os.makedirs(outputs_dir, exist_ok=True)
     out_dir = os.path.join(outputs_dir, code)
     os.makedirs(out_dir, exist_ok=True)
+    os.chmod(out_dir, 0o755)  # ensure write permissions
 
     # ── 3. Load data-source config (soil raster path) ────────────────────────
     ds_config_path = os.path.join(

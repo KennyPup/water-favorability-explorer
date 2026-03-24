@@ -154,7 +154,8 @@ export default function HFExplorer() {
   const [downloading, setDownloading] = useState(false);
   const [hfLoading,   setHfLoading]   = useState(false);
   const [tcaLoading,  setTcaLoading]  = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval>|null>(null);
+  const pollRef   = useRef<ReturnType<typeof setInterval>|null>(null);
+  const logBoxRef  = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
@@ -498,6 +499,18 @@ export default function HFExplorer() {
   // Clean up poll on unmount
   useEffect(() => () => stopPolling(), [stopPolling]);
 
+  // Auto-scroll log box to bottom whenever new lines arrive
+  useEffect(() => {
+    const el = logBoxRef.current;
+    if (!el) return;
+    // Only auto-scroll if the user is already near the bottom (within 60px),
+    // so manual scrolling upward to read history is never interrupted.
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    if (nearBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [jobLogs]);
+
   // ── Run HF pipeline (async) ───────────────────────────────────────────────
   async function onSubmit(values: FormValues) {
     console.log("[HF] Form submitted – values:", values);
@@ -840,7 +853,7 @@ export default function HFExplorer() {
 
           {/* Live progress log */}
           {(runStatus === "running" || (runStatus !== "idle" && jobLogs.length > 0)) && (
-            <div className="mb-2 rounded border border-border/50 bg-black/30 px-2 py-1.5 max-h-44 overflow-y-auto">
+            <div ref={logBoxRef} className="mb-2 rounded border border-border/50 bg-black/30 px-2 py-1.5 max-h-44 overflow-y-auto">
               <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Progress log</p>
               {jobLogs.length === 0
                 ? <p className="text-[10px] text-muted-foreground/60 italic">Waiting for pipeline…</p>

@@ -224,6 +224,22 @@ function spawnPipeline(job: HfJob, payload: object) {
     const code    = job.projectCode;
     const resolution = job.resolution;
 
+    // Verify key output files actually exist before declaring success
+    const projectDir = path.join(OUTPUTS_DIR, code);
+    const criticalFiles = [
+      path.join(projectDir, `${code}_HF_hydroFavor.tif`),
+      path.join(projectDir, `${code}_HF_metadata.json`),
+      zipPath,
+    ];
+    const missing = criticalFiles.filter(f => !fs.existsSync(f));
+    if (missing.length > 0) {
+      const msg = `Output files missing after pipeline exit: ${missing.map(f => path.basename(f)).join(", ")}`;
+      console.error(`[HF job:${job.jobId}] ${msg}`);
+      job.status = "error";
+      job.error  = msg;
+      return;
+    }
+
     job.status = "ok";
     job.logs.push("Pipeline complete ✓");
     job.result = {

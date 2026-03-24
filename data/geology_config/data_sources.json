@@ -1,7 +1,32 @@
 {
-  "_comment": "Configure paths to real geology/soil rasters here. Leave empty strings to use synthetic layers.",
-  "_geology_note": "Recommended: GLIM (Global Lithological Map) or WHYMAP hydrogeology. Expect integer class rasters with codes matching GEOLOGY_PERM_LUT in run_hf.py.",
-  "_soil_note": "Recommended: HWSD v1.2 or iSDA-Africa soil texture. Expect integer class rasters.",
+  "_comment": "Configure paths to real geology/soil rasters here.",
+
+  "_geology_note": "Recommended: GLIM or WHYMAP hydrogeology. Integer class rasters with codes matching GEOLOGY_PERM_LUT in run_hf.py. Leave empty to use Macrostrat GeoJSON (default).",
+
+  "_soil_note": [
+    "iSDA Soils (texture_class_0_20) is auto-fetched via /vsicurl/ for AOIs within sub-Saharan Africa.",
+    "For global coverage, replace the 'soil' value below with a /vsicurl/ path to a global texture raster,",
+    "e.g. SoilGrids250m from ISRIC: /vsicurl/https://files.isric.org/soilgrids/latest/data/texture.class/texture.class.vrt",
+    "Leave empty string to rely on the built-in iSDA auto-fetch (Africa only)."
+  ],
+
+  "_isda_primary_url": "/vsicurl/https://s3.amazonaws.com/isda-soils/continental_africa/10km/texture_class/texture_class_0_20.tif",
+  "_isda_alt_url":     "/vsicurl/https://storage.googleapis.com/fao-iacs-hq/isdasoil/v1/texture_class_0_20.tif",
+
+  "_perm_lut_reference": {
+    "1 (Sand)":             1.0,
+    "2 (Loamy Sand)":       1.0,
+    "3 (Sandy Loam)":       0.7,
+    "4 (Loam)":             0.7,
+    "5 (Silt Loam)":        0.5,
+    "6 (Silt)":             0.5,
+    "7 (Clay Loam)":        0.3,
+    "8 (Sandy Clay Loam)":  0.3,
+    "9 (Silty Clay Loam)":  0.2,
+    "10 (Sandy Clay)":      0.2,
+    "11 (Silty Clay)":      0.1,
+    "12 (Clay)":            0.1
+  },
 
   "geology": "",
   "soil": ""
