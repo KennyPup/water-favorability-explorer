@@ -864,12 +864,14 @@ def main():
         print(f"ERROR:JSON parse error: {e}", flush=True)
         sys.exit(1)
 
-    project_name = cfg.get("projectName", "HF Project")
-    code         = cfg.get("projectCode", "HF").upper()
-    aoi          = cfg.get("aoi", {})
-    resolution   = cfg.get("resolution", "90m")
-    weights      = cfg.get("weights", {"geology": 1.0, "soil": 1.0, "tca": 1.0})
-    outputs_dir  = cfg.get("outputsDir", os.path.join(os.getcwd(), "data", "outputs"))
+    project_name     = cfg.get("projectName", "HF Project")
+    code             = cfg.get("projectCode", "HF").upper()
+    aoi              = cfg.get("aoi", {})
+    resolution       = cfg.get("resolution", "90m")
+    weights          = cfg.get("weights", {"geology": 1.0, "soil": 1.0, "tca": 1.0})
+    outputs_dir      = cfg.get("outputsDir", os.path.join(os.getcwd(), "data", "outputs"))
+    # utmCrs override from API (e.g. "EPSG:32637") – keeps Python in sync with server response
+    utm_crs_override = cfg.get("utmCrs", None)  # optional; falls back to computed value if absent
 
     res_m = RES_M.get(resolution, 90)
 
@@ -899,8 +901,21 @@ def main():
     # ── 4. Compute UTM grid ──────────────────────────────────────────────────
     centre_lat = (minLat + maxLat) / 2
     centre_lon = (minLon + maxLon) / 2
-    epsg_code  = utm_epsg(centre_lat, centre_lon)
-    utm_crs    = CRS.from_epsg(epsg_code)
+    # Prefer the UTM CRS passed from the API (already computed server-side)
+    # so Python uses the exact same zone as the JSON response. Fall back to
+    # computing it locally if the override is absent or unparseable.
+    if utm_crs_override:
+        try:
+            utm_crs   = CRS.from_user_input(utm_crs_override)
+            epsg_code = int(utm_crs_override.upper().replace("EPSG:", ""))
+            print(f"[run_hf] UTM CRS override accepted: {utm_crs_override}", file=sys.stderr)
+        except Exception as _e:
+            print(f"[run_hf] UTM CRS override '{utm_crs_override}' unrecognised, computing from AOI: {_e}", file=sys.stderr)
+            epsg_code = utm_epsg(centre_lat, centre_lon)
+            utm_crs   = CRS.from_epsg(epsg_code)
+    else:
+        epsg_code = utm_epsg(centre_lat, centre_lon)
+        utm_crs   = CRS.from_epsg(epsg_code)
 
     min_x, max_x, min_y, max_y = bbox_to_utm(minLat, maxLat, minLon, maxLon, epsg_code)
     grid_transform, ncols, nrows = make_grid(min_x, max_x, min_y, max_y, res_m)

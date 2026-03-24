@@ -169,6 +169,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
       resolution,
       weights,
       outputsDir: OUTPUTS_DIR,
+      // Pass pre-computed UTM CRS so Python uses the same zone as the API response
+      utmCrs,
     };
 
     const script = pythonScriptPath();
