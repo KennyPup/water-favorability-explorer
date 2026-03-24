@@ -688,17 +688,27 @@ def load_or_synthesise_soil_perm(
 ) -> np.ndarray:
     """
     Load real soil permeability from iSDA Soils texture class raster via /vsicurl/,
-    reprojecting and resampling to the HF master grid.
+    reprojects and resamples to the HF master grid.
+
+    Robustness additions vs. the naive reproject():
+      - Explicitly transforms the AOI bbox into the soil source CRS before doing
+        any overlap test, avoiding a silent empty-array IndexError.
+      - Checks that the AOI actually intersects the source raster extent.
+        Raises a clear "AOI is outside of soil data bounds" error if not.
+      - Works with any single tiled or multi-tile raster: rasterio.open() handles
+        both, and the warp reads only the window that covers the AOI.
 
     Data source priority:
       1. Explicit path in data_sources.json  (local file or /vsicurl/ path)
       2. iSDA /vsicurl/ primary URL
       3. iSDA /vsicurl/ alternate URL
-      4. RAISE RuntimeError (no silent synthetic fallback in production)
-
-    Permeability is mapped from USDA texture class codes using ISDA_CODE_PERM_LUT,
-    then min-max normalised 0–1 over the AOI valid pixels.
+      4. RAISE RuntimeError if AOI is within Africa and all sources failed.
+         For AOIs outside Africa, writes a uniform 0.5 placeholder so the run
+         can complete (TCA + geology carry most weight).
     """
+    from pyproj import Transformer as _Transformer
+    from rasterio.crs import CRS as _CRS
+
     minLat = float(aoi.get("minLat", 0))
     maxLat = float(aoi.get("maxLat", 1))
     minLon = float(aoi.get("minLon", 0))
@@ -713,46 +723,89 @@ def load_or_synthesise_soil_perm(
         candidates.append((ISDA_VSICURL_URL, "iSDA /vsicurl/ primary"))
         candidates.append((ISDA_VSICURL_ALT, "iSDA /vsicurl/ alternate"))
 
-    perm = None
+    perm       = None
     last_error = None
 
     for src_path, label in candidates:
         print(f"[run_hf] Soil: trying {label}: {src_path}", file=sys.stderr)
         try:
             with rasterio.open(src_path) as src:
+                src_crs = src.crs
+
+                # ── Coordinate alignment: transform AOI bbox into the source CRS ────────
+                geo_crs = _CRS.from_epsg(4326)
+                if src_crs != geo_crs:
+                    t = _Transformer.from_crs(geo_crs, src_crs, always_xy=True)
+                    xs, ys = t.transform(
+                        [minLon, maxLon, minLon, maxLon],
+                        [minLat, minLat, maxLat, maxLat],
+                    )
+                    aoi_left, aoi_right = min(xs), max(xs)
+                    aoi_bottom, aoi_top = min(ys), max(ys)
+                else:
+                    aoi_left, aoi_right   = minLon, maxLon
+                    aoi_bottom, aoi_top   = minLat, maxLat
+
+                # ── Overlap check: does the AOI intersect the raster extent? ─────────
+                src_left, src_bottom, src_right, src_top = src.bounds
+                no_overlap = (
+                    aoi_right  <= src_left  or
+                    aoi_left   >= src_right or
+                    aoi_top    <= src_bottom or
+                    aoi_bottom >= src_top
+                )
+                if no_overlap:
+                    raise ValueError(
+                        f"AOI is outside of soil data bounds "
+                        f"(AOI [{aoi_left:.2f},{aoi_bottom:.2f} → "
+                        f"{aoi_right:.2f},{aoi_top:.2f}] vs "
+                        f"source [{src_left:.2f},{src_bottom:.2f} → "
+                        f"{src_right:.2f},{src_top:.2f}])"
+                    )
+
+                # ── Warp directly into the master grid ──────────────────────────────
                 raw = np.zeros((nrows, ncols), dtype=np.float32)
                 reproject(
                     source=rasterio.band(src, 1),
                     destination=raw,
-                    src_transform=src.transform, src_crs=src.crs,
-                    dst_transform=grid_transform, dst_crs=utm_crs,
+                    src_transform=src.transform,
+                    src_crs=src_crs,
+                    dst_transform=grid_transform,
+                    dst_crs=utm_crs,
                     resampling=Resampling.nearest,
                 )
+
+            # Sanity check: reproject() should leave at least some non-zero pixels
+            unique_codes = sorted(set(raw.astype(int).flat))[:10]
+            if len(unique_codes) <= 1 and unique_codes[0] == 0:
+                raise ValueError(
+                    "AOI is outside of soil data bounds: reprojection produced an all-zero array"
+                )
+
             perm = np.vectorize(_perm_from_code)(raw.astype(np.int32)).astype(np.float32)
             print(
                 f"[run_hf] Soil: loaded real iSDA data from {label} "
-                f"(unique codes: {sorted(set(raw.astype(int).flat))[:10]})",
+                f"(unique codes: {unique_codes})",
                 file=sys.stderr,
             )
             break
+
         except Exception as e:
             last_error = e
-            print(f"[run_hf] Soil: {label} failed: {e}", file=sys.stderr)
+            print(f"[run_hf] Soil: {label} failed – {e}", file=sys.stderr)
 
     if perm is None:
         if not _aoi_within_isda_coverage(minLat, maxLat, minLon, maxLon):
-            # AOI outside Africa – no iSDA coverage; use uniform mid-range value
-            # so the run can still complete (TCA + geology carry most weight)
             print(
                 "[run_hf] Soil: AOI outside iSDA Africa coverage – "
-                "using uniform placeholder (0.5). Set data_sources.json \"soil\": "
-                "to a /vsicurl/ path for a global soil dataset.",
+                "using uniform placeholder (0.5). "
+                "Set data_sources.json \"soil\": to a /vsicurl/ path for a global soil dataset.",
                 file=sys.stderr,
             )
             perm = np.full((nrows, ncols), 0.5, dtype=np.float32)
         else:
             raise RuntimeError(
-                f"Soil: all iSDA data sources failed and synthetic fallback is disabled. "
+                f"Soil: all iSDA sources failed and synthetic fallback is disabled. "
                 f"Last error: {last_error}"
             )
 
@@ -763,7 +816,8 @@ def load_or_synthesise_soil_perm(
         if mx > mn:
             perm = np.where(valid, (perm - mn) / (mx - mn), np.nan).astype(np.float32)
         else:
-            perm = np.where(valid, 0.5, np.nan).astype(np.float32)
+            # All same texture class – just use the raw perm value (already 0–1)
+            perm = perm.copy()
     else:
         perm = np.full((nrows, ncols), np.nan, dtype=np.float32)
 
@@ -1007,26 +1061,32 @@ def run_tca_pipeline(dem, grid_transform, utm_crs, ncols, nrows, out_dir, code):
 
 def compute_hf(geology_norm, soil_norm, tca_norm, weights, grid_transform, utm_crs, ncols, nrows, out_path):
     """
-    HF = (w_geo * G_norm + w_soil * S_norm + w_tca * TCA_norm) / (w_geo + w_soil + w_tca)
-    Only valid where all three inputs are valid (finite).
+    HF = (w_geo * G_norm + w_soil * S_norm + w_tca * TCA_norm) / Σw
+    Only valid where all *active* (weight > 0) inputs are finite.
+    Division-by-zero guard: raises ValueError if all weights are 0.
     """
-    w_geo  = weights.get("geology", 1.0)
-    w_soil = weights.get("soil",    1.0)
-    w_tca  = weights.get("tca",     1.0)
+    w_geo  = float(weights.get("geology", 1.0))
+    w_soil = float(weights.get("soil",    1.0))
+    w_tca  = float(weights.get("tca",     1.0))
     w_sum  = w_geo + w_soil + w_tca
 
-    valid = (
-        np.isfinite(geology_norm) &
-        np.isfinite(soil_norm)    &
-        np.isfinite(tca_norm)
-    )
+    if w_sum <= 0.0:
+        raise ValueError(
+            "All layer weights are 0 – at least one layer must be enabled to compute HF."
+        )
+
+    # Build the valid mask: only require finite values for layers that are active
+    valid = np.ones((nrows, ncols), dtype=bool)
+    if w_geo  > 0: valid &= np.isfinite(geology_norm)
+    if w_soil > 0: valid &= np.isfinite(soil_norm)
+    if w_tca  > 0: valid &= np.isfinite(tca_norm)
 
     hf = np.full((nrows, ncols), np.nan, dtype=np.float64)
-    hf[valid] = (
-        w_geo  * geology_norm[valid].astype(np.float64) +
-        w_soil * soil_norm[valid].astype(np.float64)    +
-        w_tca  * tca_norm[valid].astype(np.float64)
-    ) / w_sum
+    term = np.zeros((nrows, ncols), dtype=np.float64)
+    if w_geo  > 0: term[valid] += w_geo  * geology_norm[valid].astype(np.float64)
+    if w_soil > 0: term[valid] += w_soil * soil_norm[valid].astype(np.float64)
+    if w_tca  > 0: term[valid] += w_tca  * tca_norm[valid].astype(np.float64)
+    hf[valid] = term[valid] / w_sum
     hf = hf.astype(np.float32)
 
     profile = {
@@ -1045,7 +1105,6 @@ def compute_hf(geology_norm, soil_norm, tca_norm, weights, grid_transform, utm_c
     print(f"[run_hf] HF raster written (min={mn:.3f} mean={mean:.3f} max={mx:.3f}) → {out_path}",
           file=sys.stderr)
     return hf
-
 
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
@@ -1207,29 +1266,75 @@ def main():
     dem_result = fetch_dem(aoi, res_m, utm_crs, grid_transform, ncols, nrows, dem_path)
     dem, dem_source_label, dem_native_res_m, dem_resamp_method = dem_result
 
-    # ── 6. Geology permeability (from Macrostrat) ────────────────────────────
-    geo_out = os.path.join(out_dir, f"{code}_HF_geologyPerm.tif")
-    geology_norm, geology_source_label, geology_used_real = build_geology_perm_raster(
-        minLat, maxLat, minLon, maxLon,
-        utm_crs, grid_transform, ncols, nrows, geo_out
-    )
+    w_geo_v  = float(weights.get("geology", 1.0))
+    w_soil_v = float(weights.get("soil",    1.0))
+    w_tca_v  = float(weights.get("tca",     1.0))
 
-    # ── 7. Soil permeability ─────────────────────────────────────────────────
+    if w_geo_v + w_soil_v + w_tca_v <= 0.0:
+        print("ERROR:All layer weights are 0 – enable at least one layer.", flush=True)
+        sys.exit(1)
+
+    # ── 6. Geology permeability (from Macrostrat) ─────────────────────────────
+    geo_out = os.path.join(out_dir, f"{code}_HF_geologyPerm.tif")
+    if w_geo_v > 0:
+        geology_norm, geology_source_label, geology_used_real = build_geology_perm_raster(
+            minLat, maxLat, minLon, maxLon,
+            utm_crs, grid_transform, ncols, nrows, geo_out
+        )
+    else:
+        print("[run_hf] Step 6: Geology weight = 0, skipping", file=sys.stderr)
+        geology_norm         = np.zeros((nrows, ncols), dtype=np.float32)
+        geology_source_label = "skipped (weight=0)"
+        geology_used_real    = False
+        _skip_profile = {
+            "driver": "GTiff", "dtype": "float32", "width": ncols, "height": nrows, "count": 1,
+            "crs": utm_crs, "transform": grid_transform, "nodata": float("nan"), "compress": "lzw",
+        }
+        with rasterio.open(geo_out, "w", **_skip_profile) as _dst:
+            _dst.write(geology_norm, 1)
+
+    # ── 7. Soil permeability ──────────────────────────────────────────────────
     soil_out = os.path.join(out_dir, f"{code}_HF_soilPerm.tif")
-    soil_norm = load_or_synthesise_soil_perm(
-        aoi, utm_crs, grid_transform, ncols, nrows, soil_out, data_sources
-    )
+    if w_soil_v > 0:
+        soil_norm = load_or_synthesise_soil_perm(
+            aoi, utm_crs, grid_transform, ncols, nrows, soil_out, data_sources
+        )
+    else:
+        print("[run_hf] Step 7: Soil weight = 0, skipping", file=sys.stderr)
+        soil_norm = np.zeros((nrows, ncols), dtype=np.float32)
+        _skip_profile = {
+            "driver": "GTiff", "dtype": "float32", "width": ncols, "height": nrows, "count": 1,
+            "crs": utm_crs, "transform": grid_transform, "nodata": float("nan"), "compress": "lzw",
+        }
+        with rasterio.open(soil_out, "w", **_skip_profile) as _dst:
+            _dst.write(soil_norm, 1)
 
     # Free intermediate arrays before the memory-intensive TCA step
     gc.collect()
     print("[run_hf] Memory freed before TCA (gc.collect)", file=sys.stderr)
 
     # ── 8. TCA, RRZ, NRZ ────────────────────────────────────────────────────
-    tca_raw, tca_norm, p60, p80 = run_tca_pipeline(
-        dem, grid_transform, utm_crs, ncols, nrows, out_dir, code
-    )
+    if w_tca_v > 0:
+        tca_raw, tca_norm, p60, p80 = run_tca_pipeline(
+            dem, grid_transform, utm_crs, ncols, nrows, out_dir, code
+        )
+    else:
+        print("[run_hf] Step 8: TCA weight = 0, skipping", file=sys.stderr)
+        tca_norm = np.zeros((nrows, ncols), dtype=np.float32)
+        tca_raw  = tca_norm.copy()
+        p60, p80 = 0.0, 0.0
+        _tca_profile = {
+            "driver": "GTiff", "dtype": "float32", "width": ncols, "height": nrows, "count": 1,
+            "crs": utm_crs, "transform": grid_transform, "nodata": float("nan"), "compress": "lzw",
+        }
+        for _tca_fname in [
+            f"{code}_HF_tca_raw.tif", f"{code}_HF_tca_norm.tif",
+            f"{code}_HF_tca_rrz.tif", f"{code}_HF_tca_nrz.tif",
+        ]:
+            with rasterio.open(os.path.join(out_dir, _tca_fname), "w", **_tca_profile) as _dst:
+                _dst.write(tca_norm, 1)
 
-    # ── 9. HF raster ─────────────────────────────────────────────────────────
+        # ── 9. HF raster ─────────────────────────────────────────────────────────
     hf_out = os.path.join(out_dir, f"{code}_HF_hydroFavor.tif")
     hf = compute_hf(geology_norm, soil_norm, tca_norm, weights,
                     grid_transform, utm_crs, ncols, nrows, hf_out)

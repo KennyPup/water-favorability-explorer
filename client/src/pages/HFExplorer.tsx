@@ -77,13 +77,16 @@ const LAYER_LABELS: Array<{ key: keyof HfLayerUrls; label: string; ext: string }
 // zodResolver calls parse() against the raw field value which may be a JS
 // number from defaultValues – z.string() would immediately reject it.
 //
+// Weight fields are optional: blank or 0 means the layer is disabled.
+// The checkbox state is managed outside RHF as plain React state.
 const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
   projectCode: z.string().trim().min(2, "Min 2 letters").max(3, "Max 3 letters").regex(/^[A-Za-z]+$/, "Letters only (2–3)"),
   resolution:  z.enum(["30m", "90m", "1km"]),
-  wGeology:    z.coerce.number().positive("Must be > 0"),
-  wSoil:       z.coerce.number().positive("Must be > 0"),
-  wTca:        z.coerce.number().positive("Must be > 0"),
+  // Allow blank / 0 / positive — validation only when checkbox is checked
+  wGeology: z.union([z.coerce.number().min(0), z.literal("")]).transform(v => (v === "" ? 0 : Number(v))),
+  wSoil:    z.union([z.coerce.number().min(0), z.literal("")]).transform(v => (v === "" ? 0 : Number(v))),
+  wTca:     z.union([z.coerce.number().min(0), z.literal("")]).transform(v => (v === "" ? 0 : Number(v))),
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -156,6 +159,10 @@ export default function HFExplorer() {
   const [tcaLoading,  setTcaLoading]  = useState(false);
   const pollRef   = useRef<ReturnType<typeof setInterval>|null>(null);
   const logBoxRef  = useRef<HTMLDivElement>(null);
+  // Layer-enabled toggles (checkboxes). When false, weight sent as 0.
+  const [geoEnabled,  setGeoEnabled]  = useState(true);
+  const [soilEnabled, setSoilEnabled] = useState(true);
+  const [tcaEnabled,  setTcaEnabled]  = useState(true);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
@@ -499,16 +506,22 @@ export default function HFExplorer() {
   // Clean up poll on unmount
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  // Auto-scroll log box to bottom whenever new lines arrive
+  // Auto-scroll log box to bottom whenever new lines arrive.
+  // Uses requestAnimationFrame so the scroll fires after the DOM has reflowed
+  // (avoiding the stale-scrollHeight bug where nearBottom was always false).
+  // Behaviour: if the user has scrolled up more than 80px from the bottom,
+  // auto-scroll is suspended so they can read history; it resumes once they
+  // scroll back to within 80px of the bottom.
   useEffect(() => {
     const el = logBoxRef.current;
     if (!el) return;
-    // Only auto-scroll if the user is already near the bottom (within 60px),
-    // so manual scrolling upward to read history is never interrupted.
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    if (nearBottom) {
-      el.scrollTop = el.scrollHeight;
-    }
+    const frame = requestAnimationFrame(() => {
+      const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (distFromBottom < 80) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    return () => cancelAnimationFrame(frame);
   }, [jobLogs]);
 
   // ── Run HF pipeline (async) ───────────────────────────────────────────────
@@ -542,7 +555,12 @@ export default function HFExplorer() {
           projectCode: values.projectCode.toUpperCase(),
           aoi: { type: "bbox", ...aoi },
           resolution: values.resolution,
-          weights: { geology: values.wGeology, soil: values.wSoil, tca: values.wTca },
+          // If a layer's checkbox is unchecked, force its weight to 0
+          weights: {
+            geology: geoEnabled  ? (values.wGeology  || 0) : 0,
+            soil:    soilEnabled ? (values.wSoil     || 0) : 0,
+            tca:     tcaEnabled  ? (values.wTca      || 0) : 0,
+          },
         }),
       });
 
@@ -720,16 +738,45 @@ export default function HFExplorer() {
             </select>
 
             <SecHead>Layer weights</SecHead>
-            <div className="grid grid-cols-3 gap-1.5">
-              {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
-                <div key={k}>
-                  <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message}
-                    {...register(k, { valueAsNumber: true })} />
+            {/* Each layer row: [checkbox] [label] [weight input] */}
+            <div className="flex flex-col gap-1">
+              {([
+                { k: "wGeology" as const, label: "Geo",  enabled: geoEnabled,  setEnabled: setGeoEnabled  },
+                { k: "wSoil"    as const, label: "Soil", enabled: soilEnabled, setEnabled: setSoilEnabled },
+                { k: "wTca"     as const, label: "TCA",  enabled: tcaEnabled,  setEnabled: setTcaEnabled  },
+              ]).map(({ k, label, enabled, setEnabled }) => (
+                <div key={k} className="flex items-center gap-1.5">
+                  {/* Checkbox toggle */}
+                  <input
+                    type="checkbox"
+                    id={`chk_${k}`}
+                    checked={enabled}
+                    onChange={e => setEnabled(e.target.checked)}
+                    className="h-3.5 w-3.5 rounded accent-primary flex-shrink-0 cursor-pointer"
+                  />
+                  <label
+                    htmlFor={`chk_${k}`}
+                    className={cn(
+                      "text-[11px] font-medium w-8 flex-shrink-0 cursor-pointer select-none",
+                      enabled ? "text-foreground" : "text-muted-foreground/50 line-through"
+                    )}
+                  >{label}</label>
+                  <div className="flex-1 min-w-0">
+                    <FInput
+                      id={k}
+                      type="text"
+                      inputMode="decimal"
+                      disabled={!enabled}
+                      placeholder={enabled ? "1" : "off"}
+                      error={enabled ? errors[k]?.message : undefined}
+                      className={cn(!enabled && "opacity-40 pointer-events-none")}
+                      {...register(k)}
+                    />
+                  </div>
                 </div>
               ))}
             </div>
-            <p className="text-[10px] text-muted-foreground mt-1">HF = (w·G + w·S + w·TCA) / Σw</p>
+            <p className="text-[10px] text-muted-foreground mt-1">HF = (w·G + w·S + w·TCA) / Σw &nbsp;·&nbsp; uncheck to skip a layer</p>
 
             <div className="mt-auto pt-3">
               <button type="submit" disabled={running || !aoi}
