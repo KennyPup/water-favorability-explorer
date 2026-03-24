@@ -627,7 +627,7 @@ export default function HFExplorer() {
               <div>
                 <Label htmlFor="projectCode">Code (2–3 letters)</Label>
                 <FInput id="projectCode" placeholder="SHB" maxLength={3} className="uppercase" error={errors.projectCode?.message}
-                  {...register("projectCode", { setValueAs: (v: string) => v.toUpperCase() })} />
+                  {...register("projectCode")} />
               </div>
             </div>
 
