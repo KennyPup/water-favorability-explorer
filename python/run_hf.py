@@ -90,32 +90,226 @@ def make_grid(min_x, max_x, min_y, max_y, res_m: int):
     return transform, ncols, nrows
 
 
-# ─── DEM (Copernicus stub) ────────────────────────────────────────────────────
+# ─── DEM (Copernicus GLO-30 / GLO-90 via AWS open data) ─────────────────────
+#
+# Data source: ESA Copernicus DEM – publicly hosted on AWS S3 (no auth required)
+#   GLO-30  https://copernicus-dem-30m.s3.amazonaws.com/  (1-arc-second / ~30 m)
+#   GLO-90  https://copernicus-dem-90m.s3.amazonaws.com/  (3-arc-second / ~90 m)
+#
+# Tile naming convention:
+#   GLO-30: Copernicus_DSM_COG_10_{NS}{lat:02d}_00_{EW}{lon:03d}_00_DEM/
+#            └── Copernicus_DSM_COG_10_{NS}{lat:02d}_00_{EW}{lon:03d}_00_DEM.tif
+#   GLO-90: same but prefix code = 30 and bucket = copernicus-dem-90m
+#
+# Strategy:
+#   - 30m  → download GLO-30 tiles, mosaic, reproject to UTM, clip
+#   - 90m  → download GLO-90 tiles, mosaic, reproject to UTM, clip
+#   - 1km  → download GLO-90 tiles, mosaic, reproject to UTM, block-aggregate to 1000 m
+#
+# Fallback: if all tile downloads fail, generate a synthetic DEM so the rest of
+# the pipeline can still run end-to-end.
+#
 
-def fetch_copernicus_dem(aoi: dict, res_m: int, utm_crs, grid_transform, ncols, nrows, out_path: str):
+DEM_SOURCE_GLO30 = "Copernicus GLO-30 DEM (ESA/AWS open data, ~30 m native)"
+DEM_SOURCE_GLO90 = "Copernicus GLO-90 DEM (ESA/AWS open data, ~90 m native)"
+DEM_SOURCE_SYNTH = "Synthetic DEM (Copernicus unavailable)"
+
+_GLO30_BASE = "https://copernicus-dem-30m.s3.amazonaws.com"
+_GLO90_BASE = "https://copernicus-dem-90m.s3.amazonaws.com"
+
+
+def _cop_tile_url(lat_floor: int, lon_floor: int, glo90: bool = False) -> str:
     """
-    Fetch or synthesise a DEM for the AOI.
+    Return the HTTP URL for the Copernicus DEM tile whose south-west corner
+    is at (lat_floor, lon_floor).
 
-    REAL IMPLEMENTATION TODO:
-    --------------------------
-    1. Query the Copernicus DEM 30m GLO-30 tiles from AWS open-data:
-       https://registry.opendata.aws/copernicus-dem/
-       Tile naming: Copernicus_DSM_COG_10_N{lat}_00_E{lon}_00_DEM/
-    2. Download the relevant 1°×1° tiles covering the AOI.
-    3. Mosaic them with rasterio.merge.
-    4. Reproject/resample to UTM at the target resolution.
-    5. Clip to the AOI grid.
-
-    STUB (Phase 1):
-    ---------------
-    Generates a synthetic sinusoidal DEM so the rest of the pipeline
-    (flow direction, TCA, RRZ/NRZ) can run end-to-end without real data.
+    lat_floor : integer floor of latitude  (e.g. -1 for -0.5°)
+    lon_floor : integer floor of longitude (e.g. 10  for 10.3°)
+    glo90     : True → GLO-90 bucket / prefix-code 30; False → GLO-30 / code 10
     """
-    print("[run_hf] DEM: generating synthetic DEM (Copernicus stub)", file=sys.stderr)
+    ns  = "N" if lat_floor >= 0 else "S"
+    ew  = "E" if lon_floor >= 0 else "W"
+    abs_lat = abs(lat_floor)
+    abs_lon = abs(lon_floor)
+    code    = "30" if glo90 else "10"
+    base    = _GLO90_BASE if glo90 else _GLO30_BASE
+    dirname  = f"Copernicus_DSM_COG_{code}_{ns}{abs_lat:02d}_00_{ew}{abs_lon:03d}_00_DEM"
+    filename = f"{dirname}.tif"
+    return f"{base}/{dirname}/{filename}"
 
+
+def _download_cop_tile(url: str, dest_path: str, timeout: int = 120) -> bool:
+    """Download a tile to dest_path.  Returns True on success."""
+    import tempfile
+    tmp = dest_path + ".tmp"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "WaterFavorabilityExplorer/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as fh:
+            fh.write(resp.read())
+        os.replace(tmp, dest_path)
+        return True
+    except Exception as e:
+        print(f"[run_hf] DEM tile download failed ({url}): {e}", file=sys.stderr)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
+def _tiles_for_aoi(minLat: float, maxLat: float, minLon: float, maxLon: float):
+    """
+    Return a list of (lat_floor, lon_floor) integer pairs covering the AOI.
+    Copernicus tiles are 1°×1° with the south-west corner at integer degrees.
+    """
+    tiles = []
+    lat = math.floor(minLat)
+    while lat < maxLat:
+        lon = math.floor(minLon)
+        while lon < maxLon:
+            tiles.append((lat, lon))
+            lon += 1
+        lat += 1
+    return tiles
+
+
+def fetch_dem(
+    aoi: dict,
+    res_m: int,
+    utm_crs,
+    grid_transform,
+    ncols: int,
+    nrows: int,
+    out_path: str,
+) -> tuple:
+    """
+    Fetch a real Copernicus DEM (GLO-30 / GLO-90) for the AOI, reproject to
+    the UTM master grid, and write a GeoTIFF.
+
+    Returns (dem_array, source_label, native_res_m, resampling_method).
+    """
+    import tempfile
+    from rasterio.merge import merge as rio_merge
+
+    minLat = float(aoi.get("minLat", 0))
+    maxLat = float(aoi.get("maxLat", 1))
+    minLon = float(aoi.get("minLon", 0))
+    maxLon = float(aoi.get("maxLon", 1))
+
+    # Choose source bucket based on requested resolution
+    # 30m  → GLO-30  (native ~30 m)  direct resample
+    # 90m  → GLO-90  (native ~90 m)  direct resample
+    # 1km  → GLO-90  (native ~90 m)  aggregate to 1000 m
+    use_glo90  = res_m >= 90
+    source_label  = DEM_SOURCE_GLO90 if use_glo90 else DEM_SOURCE_GLO30
+    native_res_m  = 90 if use_glo90 else 30
+    resamp_method = "block_aggregate" if res_m == 1000 else ("3x3_mean" if res_m == 90 else "bilinear")
+
+    tiles = _tiles_for_aoi(minLat, maxLat, minLon, maxLon)
+    print(f"[run_hf] DEM: {len(tiles)} tile(s) needed for AOI "
+          f"[{minLat},{maxLat},{minLon},{maxLon}] using {'GLO-90' if use_glo90 else 'GLO-30'}",
+          file=sys.stderr)
+
+    dem_array = None  # will be set on success
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tile_paths = []
+        for (lat_f, lon_f) in tiles:
+            url    = _cop_tile_url(lat_f, lon_f, glo90=use_glo90)
+            fname  = os.path.basename(url)
+            dest   = os.path.join(tmpdir, fname)
+            if _download_cop_tile(url, dest):
+                tile_paths.append(dest)
+            else:
+                print(f"[run_hf] DEM: missing tile ({lat_f},{lon_f}), skipping",
+                      file=sys.stderr)
+
+        if not tile_paths:
+            print("[run_hf] DEM: no tiles downloaded – falling back to synthetic DEM",
+                  file=sys.stderr)
+            return _synthetic_dem(utm_crs, grid_transform, ncols, nrows, out_path)
+
+        # ── Mosaic downloaded tiles ──────────────────────────────────────────
+        print(f"[run_hf] DEM: mosaicking {len(tile_paths)} tile(s)…", file=sys.stderr)
+        src_files = [rasterio.open(p) for p in tile_paths]
+        try:
+            mosaic, mosaic_transform = rio_merge(src_files)
+            mosaic_crs = src_files[0].crs
+        finally:
+            for f in src_files:
+                f.close()
+
+        mosaic = mosaic[0].astype(np.float32)  # band 1
+        # Replace common nodata values with nan
+        nodata_val = -32768.0
+        mosaic = np.where(
+            (mosaic <= nodata_val) | ~np.isfinite(mosaic), np.nan, mosaic
+        )
+
+        # ── Reproject + resample to UTM grid ────────────────────────────────
+        # Choose Resampling method:
+        #   30m  → bilinear (downscale from ~30 m native)
+        #   90m  → average (3×3 mean)
+        #   1km  → average (block aggregate, ~11×11 native pixels)
+        if res_m == 30:
+            rsc = Resampling.bilinear
+        else:
+            rsc = Resampling.average
+
+        dem_utm = np.full((nrows, ncols), np.nan, dtype=np.float32)
+        reproject(
+            source=mosaic,
+            destination=dem_utm,
+            src_transform=mosaic_transform,
+            src_crs=mosaic_crs,
+            dst_transform=grid_transform,
+            dst_crs=utm_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=rsc,
+        )
+
+        # Fill any remaining nan pixels (off-edge) with interpolated values
+        # so pysheds doesn't choke on nodata at boundary
+        from scipy.ndimage import generic_filter
+        def _nanfill(arr):
+            if np.isnan(arr[4]):
+                v = arr[~np.isnan(arr)]
+                return float(v.mean()) if v.size else 0.0
+            return arr[4]
+        nan_mask = ~np.isfinite(dem_utm)
+        if nan_mask.any():
+            filled = generic_filter(dem_utm, _nanfill, size=3, mode="nearest")
+            dem_utm = np.where(nan_mask, filled, dem_utm).astype(np.float32)
+
+        dem_array = dem_utm
+
+    # ── Write GeoTIFF ────────────────────────────────────────────────────────
+    profile = {
+        "driver": "GTiff", "dtype": "float32",
+        "width": ncols, "height": nrows, "count": 1,
+        "crs": utm_crs, "transform": grid_transform,
+        "nodata": -9999.0, "compress": "lzw",
+    }
+    # Replace nan → nodata before writing
+    write_arr = np.where(np.isfinite(dem_array), dem_array, -9999.0).astype(np.float32)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(write_arr, 1)
+
+    valid_px = np.isfinite(dem_array)
+    elev_min = float(dem_array[valid_px].min()) if valid_px.any() else 0
+    elev_max = float(dem_array[valid_px].max()) if valid_px.any() else 0
+    print(
+        f"[run_hf] DEM written: {nrows}×{ncols} px "
+        f"elev [{elev_min:.0f}–{elev_max:.0f} m] → {out_path}",
+        file=sys.stderr,
+    )
+    return dem_array, source_label, native_res_m, resamp_method
+
+
+def _synthetic_dem(utm_crs, grid_transform, ncols, nrows, out_path: str):
+    """Fallback: deterministic sinusoidal DEM when real tiles are unavailable."""
+    print("[run_hf] DEM: generating synthetic DEM (real tiles unavailable)", file=sys.stderr)
     x_idx = np.tile(np.arange(ncols), (nrows, 1)).astype(np.float32)
     y_idx = np.tile(np.arange(nrows)[:, np.newaxis], (1, ncols)).astype(np.float32)
-
     data = (
         500.0
         + 300.0 * (y_idx / nrows)
@@ -123,7 +317,6 @@ def fetch_copernicus_dem(aoi: dict, res_m: int, utm_crs, grid_transform, ncols, 
         + 40.0  * np.sin(2 * np.pi * y_idx / nrows * 6)
         + 10.0  * np.random.default_rng(42).random((nrows, ncols)).astype(np.float32)
     ).astype(np.float32)
-
     profile = {
         "driver": "GTiff", "dtype": "float32",
         "width": ncols, "height": nrows, "count": 1,
@@ -132,9 +325,8 @@ def fetch_copernicus_dem(aoi: dict, res_m: int, utm_crs, grid_transform, ncols, 
     }
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(data, 1)
-
-    print(f"[run_hf] DEM written: {nrows}×{ncols} px → {out_path}", file=sys.stderr)
-    return data
+    print(f"[run_hf] Synthetic DEM written: {nrows}×{ncols} px → {out_path}", file=sys.stderr)
+    return data, DEM_SOURCE_SYNTH, 0, "synthetic"
 
 
 # ─── Geology permeability from Macrostrat ────────────────────────────────────
@@ -722,7 +914,8 @@ def main():
 
     # ── 5. DEM ───────────────────────────────────────────────────────────────
     dem_path = os.path.join(out_dir, f"{code}_HF_dem.tif")
-    dem = fetch_copernicus_dem(aoi, res_m, utm_crs, grid_transform, ncols, nrows, dem_path)
+    dem_result = fetch_dem(aoi, res_m, utm_crs, grid_transform, ncols, nrows, dem_path)
+    dem, dem_source_label, dem_native_res_m, dem_resamp_method = dem_result
 
     # ── 6. Geology permeability (from Macrostrat) ────────────────────────────
     geo_out = os.path.join(out_dir, f"{code}_HF_geologyPerm.tif")
@@ -775,7 +968,14 @@ def main():
         "gridRows":          nrows,
         "pixelCount":        pixel_count,
         "estimatedOutputMB": output_size_mb,
-        "demSource":         "Copernicus GLO-30 (STUB – synthetic in Phase 1)",
+        "demSource": {
+            "name":            dem_source_label,
+            "gloBucket":       "copernicus-dem-30m / copernicus-dem-90m (AWS open data)",
+            "nativeResM":      dem_native_res_m,
+            "finalResM":       res_m,
+            "finalCrs":        f"EPSG:{epsg_code}",
+            "resamplingMethod": dem_resamp_method,
+        },
         "geologySource": {
             "name":          geology_source_label,
             "apiUrl":        MACROSTRAT_API_URL,

@@ -219,6 +219,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
         layerUrls: buildLayerUrls(code, resolution),
         // Preview PNG URL for HF map overlay
         previewUrl: `/api/hf/preview?projectCode=${code}&resolution=${resolution}`,
+        // Preview PNG URL for TCA overlay (light→dark blue ramp)
+        tcaPreviewUrl: `/api/hf/preview?projectCode=${code}&resolution=${resolution}&layer=tca`,
       });
     });
 
@@ -295,21 +297,37 @@ export function registerRoutes(httpServer: Server, app: Express) {
     stream.on("error", (e: Error) => { console.error("[HF File]", e); res.destroy(); });
   });
 
-  // ── GET /api/hf/preview – render HF raster as PNG for Leaflet overlay ─────
-  // Uses Python to convert the GeoTIFF → PNG with colour ramp + returns
-  // {pngUrl, bounds} so the frontend can use L.imageOverlay.
+  // ── GET /api/hf/preview – render HF or TCA raster as PNG for Leaflet overlay
+  // Query params:
+  //   projectCode  – required
+  //   layer        – "hf" (default) | "tca"   selects which GeoTIFF to render
+  //   resolution   – optional (unused for routing, kept for cache-busting)
+  //
+  // Returns {ok, pngUrl, bounds} so the frontend can use L.imageOverlay.
+  //
+  // Colour ramps:
+  //   hf  → blue → green → yellow → red  (low→high favorability)
+  //   tca → light blue → dark blue        (low→high flow accumulation)
   app.get("/api/hf/preview", (req, res) => {
     const projectCode = (req.query.projectCode as string | undefined)?.toUpperCase();
+    const layer       = (req.query.layer as string | undefined) ?? "hf";
     const resolution  = req.query.resolution as string | undefined;
 
     if (!projectCode) return res.status(400).json({ error: "projectCode required" });
+    if (layer !== "hf" && layer !== "tca")
+      return res.status(400).json({ error: `Unknown layer "${layer}". Valid: hf, tca` });
 
     const projectDir = path.join(OUTPUTS_DIR, projectCode);
-    const tifPath    = path.join(projectDir, `${projectCode}_HF_hydroFavor.tif`);
     const metaPath   = path.join(projectDir, `${projectCode}_HF_metadata.json`);
 
+    const tifPath  = layer === "tca"
+      ? path.join(projectDir, `${projectCode}_HF_tca_norm.tif`)
+      : path.join(projectDir, `${projectCode}_HF_hydroFavor.tif`);
+
+    const tifLabel = layer === "tca" ? "TCA" : "HF";
+
     if (!fs.existsSync(tifPath))
-      return res.status(404).json({ error: `HF raster not found for ${projectCode}. Run pipeline first.` });
+      return res.status(404).json({ error: `${tifLabel} raster not found for ${projectCode}. Run pipeline first.` });
 
     // Read metadata for bounds
     let bounds: { minLat: number; maxLat: number; minLon: number; maxLon: number } | null = null;
@@ -320,17 +338,17 @@ export function registerRoutes(httpServer: Server, app: Express) {
       } catch { /* ignore */ }
     }
 
-    // PNG output path
-    const pngName = `${projectCode}_HF_preview.png`;
-    const pngPath = path.join(projectDir, pngName);
+    // PNG output path (layer-specific so HF and TCA PNGs don't collide)
+    const pngSuffix = layer === "tca" ? "_TCA_preview.png" : "_HF_preview.png";
+    const pngPath   = path.join(projectDir, `${projectCode}${pngSuffix}`);
 
-    // Spawn tiny Python renderer
+    // Inline Python renderer – parameterised by colour ramp
     const pyCode = `
 import sys, json, numpy as np, rasterio
-from pathlib import Path
 
-tif_path = sys.argv[1]
+tif_path  = sys.argv[1]
 png_path  = sys.argv[2]
+layer_key = sys.argv[3]  # 'hf' or 'tca'
 
 with rasterio.open(tif_path) as src:
     data = src.read(1).astype(np.float64)
@@ -339,25 +357,35 @@ with rasterio.open(tif_path) as src:
     crs = src.crs
 
 if nodata is not None:
-    data = np.where(data == nodata, np.nan, data)
+    data = np.where((data == nodata) | (data < -9990), np.nan, data)
 
-# Normalise to 0-1 if not already
+# Normalise to 0-1
 valid = np.isfinite(data)
 if valid.any():
     mn, mx = data[valid].min(), data[valid].max()
     if mx > mn:
         data = np.where(valid, (data - mn) / (mx - mn), np.nan)
 
-# Blue->Green->Yellow->Red colour ramp (4 stops at 0, 0.33, 0.66, 1)
 h, w = data.shape
 rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
-stops = [
-    (0.00, (0,   0,   200)),  # blue
-    (0.33, (0,   180,  80)),  # green
-    (0.66, (255, 220,   0)),  # yellow
-    (1.00, (220,  30,  30)),  # red
-]
+# Colour ramp definition
+if layer_key == 'tca':
+    # Light blue → dark blue (low TCA = pale, high TCA = deep blue channels)
+    stops = [
+        (0.00, (200, 230, 255)),  # very light blue
+        (0.33, (100, 180, 255)),  # sky blue
+        (0.66, ( 30, 100, 220)),  # medium blue
+        (1.00, (  0,  20, 140)),  # deep dark blue
+    ]
+else:
+    # Blue → Green → Yellow → Red (HF favorability)
+    stops = [
+        (0.00, (  0,   0, 200)),
+        (0.33, (  0, 180,  80)),
+        (0.66, (255, 220,   0)),
+        (1.00, (220,  30,  30)),
+    ]
 
 def lerp_color(v):
     for i in range(len(stops) - 1):
@@ -368,7 +396,6 @@ def lerp_color(v):
             return tuple(int(c0[j] + f * (c1[j] - c0[j])) for j in range(3))
     return stops[-1][1]
 
-# Vectorised colour mapping
 for i in range(h):
     for j in range(w):
         v = data[i, j]
@@ -379,41 +406,39 @@ for i in range(h):
             rgba[i, j] = (r, g, b, 200)
 
 from PIL import Image
-img = Image.fromarray(rgba, "RGBA")
-img.save(png_path)
+Image.fromarray(rgba, 'RGBA').save(png_path)
 
 # Reproject bounds to WGS84 if needed
 try:
     from pyproj import Transformer
     if not crs.is_geographic:
-        t = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        t = Transformer.from_crs(crs, 'EPSG:4326', always_xy=True)
         minx, miny = bounds_raster.left, bounds_raster.bottom
         maxx, maxy = bounds_raster.right, bounds_raster.top
-        corners_x = [minx, maxx, minx, maxx]
-        corners_y = [miny, miny, maxy, maxy]
-        lons, lats = t.transform(corners_x, corners_y)
-        geo_bounds = {"minLat": min(lats), "maxLat": max(lats), "minLon": min(lons), "maxLon": max(lons)}
+        lons, lats = t.transform([minx, maxx, minx, maxx], [miny, miny, maxy, maxy])
+        geo_bounds = {'minLat': min(lats), 'maxLat': max(lats), 'minLon': min(lons), 'maxLon': max(lons)}
     else:
-        geo_bounds = {"minLat": bounds_raster.bottom, "maxLat": bounds_raster.top, "minLon": bounds_raster.left, "maxLon": bounds_raster.right}
+        geo_bounds = {'minLat': bounds_raster.bottom, 'maxLat': bounds_raster.top, 'minLon': bounds_raster.left, 'maxLon': bounds_raster.right}
 except Exception as e:
-    geo_bounds = {"error": str(e)}
+    geo_bounds = {'error': str(e)}
 
-print(json.dumps({"ok": True, "bounds": geo_bounds}))
+print(json.dumps({'ok': True, 'bounds': geo_bounds}))
 `;
 
-    const py = spawn("python3", ["-c", pyCode, tifPath, pngPath], { timeout: 60_000 });
+    const py = spawn("python3", ["-c", pyCode, tifPath, pngPath, layer], { timeout: 60_000 });
     let stdout = "", stderr = "";
     py.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
     py.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
 
     py.on("close", (code_: number | null) => {
       if (code_ !== 0) {
-        console.error("[HF Preview] Python error:", stderr.slice(0, 400));
-        return res.status(500).json({ error: "Preview render failed: " + stderr.slice(0, 200) });
+        console.error(`[HF Preview/${layer}] Python error:`, stderr.slice(0, 400));
+        return res.status(500).json({ error: `Preview render failed: ${stderr.slice(0, 200)}` });
       }
       try {
         const result = JSON.parse(stdout.trim());
-        const pngUrl = `/api/hf/preview-image?projectCode=${projectCode}`;
+        // layer-specific image URL so HF and TCA don't clash
+        const pngUrl = `/api/hf/preview-image?projectCode=${projectCode}&layer=${layer}`;
         return res.json({ ok: true, pngUrl, bounds: result.bounds ?? bounds });
       } catch {
         return res.status(500).json({ error: "Preview parse failed: " + stdout.slice(0, 100) });
@@ -424,9 +449,11 @@ print(json.dumps({"ok": True, "bounds": geo_bounds}))
   // ── GET /api/hf/preview-image – serve the rendered PNG ──────────────────
   app.get("/api/hf/preview-image", (req, res) => {
     const projectCode = (req.query.projectCode as string | undefined)?.toUpperCase();
+    const layer       = (req.query.layer as string | undefined) ?? "hf";
     if (!projectCode) return res.status(400).json({ error: "projectCode required" });
 
-    const pngPath = path.join(OUTPUTS_DIR, projectCode, `${projectCode}_HF_preview.png`);
+    const pngSuffix = layer === "tca" ? "_TCA_preview.png" : "_HF_preview.png";
+    const pngPath   = path.join(OUTPUTS_DIR, projectCode, `${projectCode}${pngSuffix}`);
     if (!fs.existsSync(pngPath))
       return res.status(404).json({ error: "Preview PNG not found. Call /api/hf/preview first." });
 

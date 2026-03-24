@@ -67,4 +67,6 @@ export interface HfRunResponse {
   outputs?:   HfOutputFiles;
   layerUrls?: HfLayerUrls;
   previewUrl?: string;
+  /** PNG URL for the TCA (log-normalised flow accumulation) map overlay */
+  tcaPreviewUrl?: string;
 }

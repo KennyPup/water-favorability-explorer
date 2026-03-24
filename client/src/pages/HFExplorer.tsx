@@ -49,7 +49,7 @@ const LAYER_LABELS: Array<{ key: keyof HfLayerUrls; label: string; ext: string }
   { key: "tca_norm", label: "TCA – log-normalised",        ext: ".tif" },
   { key: "rrz",      label: "RRZ (TCA ≥ P80)",            ext: ".tif" },
   { key: "nrz",      label: "NRZ (P60 ≤ TCA < P80)",     ext: ".tif" },
-  { key: "dem",      label: "DEM (Copernicus stub)",       ext: ".tif" },
+  { key: "dem",      label: "DEM (Copernicus GLO-30/90)",   ext: ".tif" },
   { key: "weights",  label: "Weights matrix",              ext: ".csv" },
   { key: "metadata", label: "Run metadata",                ext: ".json" },
 ];
@@ -96,6 +96,7 @@ export default function HFExplorer() {
   const corner1MarkerRef = useRef<L.CircleMarker | null>(null);
   const macroLayerRef    = useRef<L.TileLayer | null>(null);
   const hfOverlayRef     = useRef<L.ImageOverlay | null>(null);
+  const tcaOverlayRef    = useRef<L.ImageOverlay | null>(null);
   const rectStepRef      = useRef<0|1>(0);
   const geoOpacityRef    = useRef(0);
   const geoPopupRef      = useRef<L.Popup | null>(null);
@@ -104,6 +105,7 @@ export default function HFExplorer() {
   const [rectStep,    setRectStep]    = useState<0|1>(0);
   const [geoOpacity,  setGeoOpacity]  = useState(0);
   const [hfOpacity,   setHfOpacity]   = useState(70);
+  const [tcaOpacity,  setTcaOpacity]  = useState(0);
   const [aoi, setAoi]   = useState<{ minLat:number; maxLat:number; minLon:number; maxLon:number }|null>(null);
   const [searchText,   setSearchText]   = useState("");
   const [searchLoading, setSearchLoading] = useState(false);
@@ -113,6 +115,7 @@ export default function HFExplorer() {
   const [result,      setResult]      = useState<HfRunResponse|null>(null);
   const [downloading, setDownloading] = useState(false);
   const [hfLoading,   setHfLoading]   = useState(false);
+  const [tcaLoading,  setTcaLoading]  = useState(false);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
@@ -326,6 +329,42 @@ export default function HFExplorer() {
     if (hfOverlayRef.current) hfOverlayRef.current.setOpacity(hfOpacity / 100);
   }, [hfOpacity]);
 
+
+  // ── TCA overlay opacity/load ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!leafletMap.current) return;
+    if (tcaOpacity === 0) {
+      if (tcaOverlayRef.current) {
+        leafletMap.current.removeLayer(tcaOverlayRef.current);
+        tcaOverlayRef.current = null;
+      }
+    } else if (tcaOverlayRef.current) {
+      tcaOverlayRef.current.setOpacity(tcaOpacity / 100);
+    }
+  }, [tcaOpacity]);
+
+  // ── Load TCA overlay onto map ─────────────────────────────────────────────
+  const loadTcaOverlay = useCallback(async (projectCode: string, resolution: string) => {
+    if (!leafletMap.current) return;
+    setTcaLoading(true);
+    try {
+      const r = await fetch(`/api/hf/preview?projectCode=${projectCode}&resolution=${resolution}&layer=tca`);
+      if (!r.ok) { toast({ title: 'TCA preview unavailable', variant: 'destructive' }); return; }
+      const data = await r.json();
+      const { pngUrl, bounds } = data;
+      if (!pngUrl || !bounds) return;
+      if (tcaOverlayRef.current) { leafletMap.current.removeLayer(tcaOverlayRef.current); tcaOverlayRef.current = null; }
+      const lb: L.LatLngBoundsExpression = [[bounds.minLat, bounds.minLon], [bounds.maxLat, bounds.maxLon]];
+      tcaOverlayRef.current = L.imageOverlay(pngUrl, lb, { opacity: tcaOpacity / 100, interactive: false, zIndex: 350 }).addTo(leafletMap.current);
+      aoiLayerRef.current?.bringToFront();
+      if (hfOverlayRef.current) hfOverlayRef.current.bringToFront();
+    } catch (e: unknown) {
+      toast({ title: 'TCA overlay error', description: String(e), variant: 'destructive' });
+    } finally {
+      setTcaLoading(false);
+    }
+  }, [tcaOpacity]);
+
   // ── Load HF preview overlay onto map ─────────────────────────────────────
   const loadHfOverlay = useCallback(async (projectCode: string, resolution: string) => {
     if (!leafletMap.current) return;
@@ -387,11 +426,16 @@ export default function HFExplorer() {
     setRunStatus("running");
     setResult(null);
 
-    // Remove previous HF overlay
+    // Remove previous HF + TCA overlays
     if (hfOverlayRef.current && leafletMap.current) {
       leafletMap.current.removeLayer(hfOverlayRef.current);
       hfOverlayRef.current = null;
     }
+    if (tcaOverlayRef.current && leafletMap.current) {
+      leafletMap.current.removeLayer(tcaOverlayRef.current);
+      tcaOverlayRef.current = null;
+    }
+    setTcaOpacity(0);
 
     try {
       const res = await fetch("/api/hf/run", {
@@ -414,6 +458,10 @@ export default function HFExplorer() {
         toast({ title: "HF v1 complete", description: data.outputs?.zipName });
         // Auto-load HF preview onto map
         await loadHfOverlay(data.projectCode!, data.resolution!);
+        // Pre-render TCA PNG (loaded on demand when user moves slider)
+        if (data.tcaPreviewUrl) {
+          await loadTcaOverlay(data.projectCode!, data.resolution!);
+        }
       }
       setResult(data);
     } catch (err: unknown) {
@@ -617,18 +665,46 @@ export default function HFExplorer() {
                 <span className="text-[10px] text-white/60 w-7 text-right">{hfOpacity}%</span>
               </div>
             )}
+
+            {/* TCA slider – only show after a successful run */}
+            {result?.status === "ok" && (
+              <div className="flex items-center gap-2 bg-black/65 backdrop-blur rounded px-2.5 py-1.5 text-xs text-white">
+                <span className="text-[10px] uppercase tracking-wider w-14" style={{ color: tcaOpacity > 0 ? "#93c5fd" : "rgba(255,255,255,0.4)" }}>TCA</span>
+                <input type="range" min={0} max={100} step={5} value={tcaOpacity}
+                  onChange={(e) => setTcaOpacity(Number(e.target.value))}
+                  style={{ width: 70, accentColor: "#3b82f6", cursor: "pointer" }}
+                  title={`TCA overlay opacity: ${tcaOpacity}%`}
+                />
+                <span className="text-[10px] w-7 text-right" style={{ color: tcaOpacity > 0 ? "#93c5fd" : "rgba(255,255,255,0.4)" }}>{tcaOpacity > 0 ? `${tcaOpacity}%` : "off"}</span>
+              </div>
+            )}
           </div>
 
-          {/* HF colour ramp legend */}
+          {/* Legends – bottom-right */}
           {result?.status === "ok" && (
-            <div className="absolute bottom-4 right-3 z-[999] bg-black/65 backdrop-blur rounded px-2.5 py-2 text-[10px] text-white">
-              <p className="uppercase tracking-wider text-white/60 mb-1">HF score</p>
-              <div className="flex items-center gap-1.5">
-                <div style={{ width: 80, height: 10, background: "linear-gradient(to right, #0000c8, #00b450, #ffdc00, #dc1e1e)", borderRadius: 3 }} />
+            <div className="absolute bottom-4 right-3 z-[999] flex flex-col gap-1.5">
+              {/* HF score legend */}
+              <div className="bg-black/65 backdrop-blur rounded px-2.5 py-2 text-[10px] text-white">
+                <p className="uppercase tracking-wider text-white/60 mb-1">HF score</p>
+                <div className="flex items-center gap-1.5">
+                  <div style={{ width: 80, height: 10, background: "linear-gradient(to right, #0000c8, #00b450, #ffdc00, #dc1e1e)", borderRadius: 3 }} />
+                </div>
+                <div className="flex justify-between mt-0.5" style={{ width: 80 }}>
+                  <span>0</span><span>0.5</span><span>1</span>
+                </div>
               </div>
-              <div className="flex justify-between mt-0.5" style={{ width: 80 }}>
-                <span>0</span><span>0.5</span><span>1</span>
-              </div>
+              {/* TCA legend – shown when TCA slider is active */}
+              {tcaOpacity > 0 && (
+                <div className="bg-black/65 backdrop-blur rounded px-2.5 py-2 text-[10px] text-white">
+                  <p className="uppercase tracking-wider text-white/60 mb-1">TCA (flow accum.)</p>
+                  <div className="flex items-center gap-1.5">
+                    <div style={{ width: 80, height: 10, background: "linear-gradient(to right, #c8e6ff, #64b4ff, #1e64dc, #00148c)", borderRadius: 3 }} />
+                  </div>
+                  <div className="flex justify-between mt-0.5" style={{ width: 80 }}>
+                    <span>low</span><span>high</span>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
