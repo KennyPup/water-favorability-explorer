@@ -35,6 +35,20 @@ async function geocode(query: string): Promise<{ lat: number; lon: number } | nu
   return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
 }
 
+// ─── UTM zone helper ──────────────────────────────────────────────────────────
+// Mirrors utm_epsg() in run_hf.py exactly so the frontend preview matches Python.
+function utmEpsg(centreLat: number, centreLon: number): string {
+  const zone = Math.floor((centreLon + 180) / 6) + 1;
+  const base  = centreLat >= 0 ? 32600 : 32700;
+  return `EPSG:${base + zone}`;
+}
+function utmLabel(centreLat: number, centreLon: number): string {
+  const zone    = Math.floor((centreLon + 180) / 6) + 1;
+  const hemi    = centreLat >= 0 ? "N" : "S";
+  const epsg    = utmEpsg(centreLat, centreLon);
+  return `UTM ${zone}${hemi}  ·  ${epsg}`;
+}
+
 // ─── Layout ───────────────────────────────────────────────────────────────────
 const LEFT_W  = 268;
 const RIGHT_W = 272;
@@ -55,13 +69,30 @@ const LAYER_LABELS: Array<{ key: keyof HfLayerUrls; label: string; ext: string }
 ];
 
 // ─── Form schema ──────────────────────────────────────────────────────────────
+//
+// Weight fields accept BOTH string (typed by user) AND number (from defaultValues /
+// programmatic reset). z.string() alone hard-rejects JS numbers, causing the
+// "Expected string, received number" / "Required" errors on untouched fields.
+//
+// z.union([z.string(), z.number()]) → trim → normalise leading decimal → coerce
+// covers every realistic input source without any special register() tricks.
+//
+const _weightField = z
+  .union([z.string(), z.number()])
+  .transform(v => {
+    const s = String(v).trim();
+    return s.startsWith(".") ? "0" + s : s;
+  })
+  .pipe(z.coerce.number().positive("Must be > 0"));
+
 const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
-  projectCode: z.string().min(2).max(3).regex(/^[A-Za-z]+$/, "2–3 letters"),
+  // .trim() so accidental leading/trailing spaces don't break the regex
+  projectCode: z.string().trim().min(2, "Min 2 letters").max(3, "Max 3 letters").regex(/^[A-Za-z]+$/, "Letters only (2–3)"),
   resolution:  z.enum(["30m", "90m", "1km"]),
-  wGeology:    z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
-  wSoil:       z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
-  wTca:        z.string().transform(v => v.startsWith(".") ? "0" + v : v).pipe(z.coerce.number().positive("Must be > 0")),
+  wGeology:    _weightField,
+  wSoil:       _weightField,
+  wTca:        _weightField,
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -120,7 +151,7 @@ export default function HFExplorer() {
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: 1.0, wSoil: 1.0, wTca: 1.0 },
+    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: "1", wSoil: "1", wTca: "1" },
   });
 
   useEffect(() => {
@@ -596,11 +627,16 @@ export default function HFExplorer() {
             <SecHead>AOI</SecHead>
             <div className={cn("rounded border px-2 py-1.5 text-[11px]", aoi ? "border-[#22d3ee]/40 bg-[#22d3ee]/5 text-[#22d3ee]/80" : "border-border text-muted-foreground italic")}>
               {aoi
-                ? <div className="flex items-center justify-between">
-                    <span>Rectangle drawn ✓</span>
-                    <button type="button" onClick={() => { setAoi(null); aoiLayerRef.current?.clearLayers(); if (hfOverlayRef.current && leafletMap.current) { leafletMap.current.removeLayer(hfOverlayRef.current); hfOverlayRef.current = null; } }}
-                      className="text-[10px] underline text-muted-foreground hover:text-destructive ml-2">clear</button>
-                  </div>
+                ? <>
+                    <div className="flex items-center justify-between">
+                      <span>Rectangle drawn ✓</span>
+                      <button type="button" onClick={() => { setAoi(null); aoiLayerRef.current?.clearLayers(); if (hfOverlayRef.current && leafletMap.current) { leafletMap.current.removeLayer(hfOverlayRef.current); hfOverlayRef.current = null; } if (tcaOverlayRef.current && leafletMap.current) { leafletMap.current.removeLayer(tcaOverlayRef.current); tcaOverlayRef.current = null; } setTcaOpacity(0); }}
+                        className="text-[10px] underline text-muted-foreground hover:text-destructive ml-2">clear</button>
+                    </div>
+                    <div className="mt-1 font-mono text-[10px] text-[#22d3ee]/70">
+                      {utmLabel((aoi.minLat + aoi.maxLat) / 2, (aoi.minLon + aoi.maxLon) / 2)}
+                    </div>
+                  </>
                 : <span>{rectStep === 0 ? "Click map: first corner" : "Click map: second corner"}</span>
               }
             </div>
@@ -744,8 +780,14 @@ export default function HFExplorer() {
           {/* UTM CRS – prominent */}
           {result?.utmCrs && (
             <div className="rounded border border-[#22d3ee]/30 bg-[#22d3ee]/5 px-2.5 py-1.5 mb-2">
-              <p className="text-[9px] uppercase tracking-wider text-muted-foreground">UTM CRS</p>
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Target UTM CRS</p>
               <p className="font-mono text-sm font-semibold text-[#22d3ee]">{result.utmCrs}</p>
+              {result.aoi && (
+                <p className="font-mono text-[10px] text-[#22d3ee]/60 mt-0.5">
+                  {utmLabel((result.aoi.minLat + result.aoi.maxLat) / 2, (result.aoi.minLon + result.aoi.maxLon) / 2)}
+                </p>
+              )}
+              <p className="text-[9px] text-muted-foreground/60 mt-1">All rasters reproject to this zone</p>
             </div>
           )}
 
