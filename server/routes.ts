@@ -131,16 +131,23 @@ function pythonScriptPath(): string {
 
 /**
  * Resolve the correct Python executable.
- * Render (and most Linux hosts) only have `python3`.
+ * Render uses python3 exclusively. We probe python3 first, fall back to python.
+ * Result is cached after first call.
  */
+let _pythonExec: string | null = null;
 function pythonExecutable(): string {
+  if (_pythonExec) return _pythonExec;
   for (const cmd of ["python3", "python"]) {
     try {
-      execFileSync(cmd, ["--version"], { stdio: "ignore" });
+      const ver = execFileSync(cmd, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      console.log(`[HF] Found Python: ${cmd} → ${ver.trim()}`);
+      _pythonExec = cmd;
       return cmd;
-    } catch { /* not found */ }
+    } catch { /* not found, try next */ }
   }
-  return "python3";
+  console.warn("[HF] WARNING: no python3/python found on PATH – spawn will fail");
+  _pythonExec = "python3";
+  return _pythonExec;
 }
 
 /** Build per-layer download URL map */
@@ -167,7 +174,15 @@ function spawnPipeline(job: HfJob, payload: object) {
   const projectDir = path.join(OUTPUTS_DIR, job.projectCode);
   fs.mkdirSync(projectDir, { recursive: true });
 
-  const py = spawn(pythonCmd, [script], { timeout: 30 * 60 * 1000 });
+  const py = spawn(pythonCmd, [script], {
+    timeout: 30 * 60 * 1000,
+    env: {
+      ...process.env,
+      // Force unbuffered stdout/stderr so progress lines reach us immediately
+      PYTHONUNBUFFERED: "1",
+      PYTHONDONTWRITEBYTECODE: "1",
+    },
+  });
   let stdout = "";
 
   py.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });

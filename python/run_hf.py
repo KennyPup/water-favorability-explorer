@@ -39,9 +39,13 @@ user sees on the map is the same geology driving the HF permeability raster.
 
 import sys
 import os
+import gc
 import json
 import math
+import time
 import zipfile
+import threading
+import argparse
 import traceback
 import urllib.request
 import urllib.parse
@@ -60,6 +64,23 @@ import pyproj
 # ─── Resolution helpers ───────────────────────────────────────────────────────
 
 RES_M = {"30m": 30, "90m": 90, "1km": 1000}
+
+# Maximum pixel count before we decimate the DEM for TCA to protect Render's
+# ~512 MB RAM limit.  4 M pixels @ float32 ≈ 16 MB per array; pysheds needs
+# ~8× that in working memory, so we cap at ~4 M for safety.
+MAX_TCA_PIXELS = 4_000_000
+
+
+def _heartbeat(label: str, stop_event: threading.Event, interval: int = 30):
+    """
+    Background thread: prints a keep-alive line every `interval` seconds until
+    stop_event is set.  Prevents Render/proxies from timing out during TCA.
+    """
+    start = time.time()
+    while not stop_event.wait(interval):
+        elapsed = int(time.time() - start)
+        print(f"[run_hf] ♥ {label} still running … {elapsed}s elapsed",
+              file=sys.stderr, flush=True)
 
 
 def utm_epsg(centre_lat: float, centre_lon: float) -> int:
@@ -687,9 +708,61 @@ def run_tca_pipeline(dem, grid_transform, utm_crs, ncols, nrows, out_dir, code):
     """
     Compute flow accumulation (TCA) from the DEM using pysheds or whitebox.
     Falls back to a deterministic synthetic TCA if no library is available.
+    Large grids (> MAX_TCA_PIXELS) are automatically decimated before flow
+    accumulation and upsampled back to the full grid afterward.
     """
+    from scipy.ndimage import zoom as ndimage_zoom
+    import tempfile
 
-    def _write_tif(data, path, dtype="float32", nodata=None):
+    tca_raw_path  = os.path.join(out_dir, f"{code}_HF_tca_raw.tif")
+    tca_norm_path = os.path.join(out_dir, f"{code}_HF_tca_norm.tif")
+    tca_rrz_path  = os.path.join(out_dir, f"{code}_HF_tca_rrz.tif")
+    tca_nrz_path  = os.path.join(out_dir, f"{code}_HF_tca_nrz.tif")
+
+    # ── Decimation for large grids ────────────────────────────────────────────
+    pixel_count = ncols * nrows
+    decimated   = False
+    tca_dem     = dem  # working copy; may be replaced by decimated version
+    tca_cols    = ncols
+    tca_rows    = nrows
+    tca_transform = grid_transform
+
+    if pixel_count > MAX_TCA_PIXELS:
+        scale = (MAX_TCA_PIXELS / pixel_count) ** 0.5
+        tca_cols  = max(2, int(ncols * scale))
+        tca_rows  = max(2, int(nrows * scale))
+        row_scale = tca_rows / nrows
+        col_scale = tca_cols / ncols
+        print(
+            f"[run_hf] TCA: grid {ncols}x{nrows} ({pixel_count:,} px) exceeds "
+            f"{MAX_TCA_PIXELS:,}; decimating to {tca_cols}x{tca_rows} "
+            f"(scale={scale:.3f})",
+            file=sys.stderr,
+        )
+        tca_dem = ndimage_zoom(dem.astype(np.float64), (row_scale, col_scale), order=1).astype(np.float32)
+        tca_transform = rasterio.transform.from_bounds(
+            grid_transform.c,
+            grid_transform.f + grid_transform.e * nrows,
+            grid_transform.c + grid_transform.a * ncols,
+            grid_transform.f,
+            tca_cols, tca_rows,
+        )
+        decimated = True
+        gc.collect()
+
+    # Helper: write a tif at the WORKING (possibly decimated) resolution
+    def _write_tif_working(data, path, dtype="float32", nodata=None):
+        profile = {
+            "driver": "GTiff", "dtype": dtype,
+            "width": tca_cols, "height": tca_rows, "count": 1,
+            "crs": utm_crs, "transform": tca_transform,
+            "nodata": nodata if nodata is not None else float("nan"), "compress": "lzw",
+        }
+        with rasterio.open(path, "w", **profile) as dst:
+            dst.write(data.astype(dtype), 1)
+
+    # Helper: write a tif at the FULL grid resolution
+    def _write_tif_full(data, path, dtype="float32", nodata=None):
         profile = {
             "driver": "GTiff", "dtype": dtype,
             "width": ncols, "height": nrows, "count": 1,
@@ -699,79 +772,121 @@ def run_tca_pipeline(dem, grid_transform, utm_crs, ncols, nrows, out_dir, code):
         with rasterio.open(path, "w", **profile) as dst:
             dst.write(data.astype(dtype), 1)
 
-    tca_raw_path  = os.path.join(out_dir, f"{code}_HF_tca_raw.tif")
-    tca_norm_path = os.path.join(out_dir, f"{code}_HF_tca_norm.tif")
-    tca_rrz_path  = os.path.join(out_dir, f"{code}_HF_tca_rrz.tif")
-    tca_nrz_path  = os.path.join(out_dir, f"{code}_HF_tca_nrz.tif")
+    tca_raw_work = None  # result at working resolution
 
-    tca_raw = None
+    # ── Heartbeat thread (keeps Render connection alive during long calculation)
+    stop_hb = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat, args=("TCA flow accumulation", stop_hb, 30), daemon=True
+    )
+    hb_thread.start()
 
-    # ── Try pysheds ──────────────────────────────────────────────────────────
     try:
-        from pysheds.grid import Grid
-        import tempfile
-
-        print("[run_hf] TCA: using pysheds D8 flow accumulation", file=sys.stderr)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dem_path_tmp = os.path.join(tmpdir, "dem.tif")
-            _write_tif(dem, dem_path_tmp)
-            grid = Grid.from_raster(dem_path_tmp)
-            dem_data = grid.read_raster(dem_path_tmp)
-            pit_filled = grid.fill_pits(dem_data)
-            flooded    = grid.fill_depressions(pit_filled)
-            inflated   = grid.resolve_flats(flooded)
-            fdir = grid.flowdir(inflated)
-            acc = grid.accumulation(fdir).astype(np.float32)
-            tca_raw = acc
-
-    except ImportError:
-        print("[run_hf] TCA: pysheds not found, trying whitebox…", file=sys.stderr)
-
-    # ── Try whitebox ─────────────────────────────────────────────────────────
-    if tca_raw is None:
+        # ── Try pysheds ──────────────────────────────────────────────────────
         try:
-            import whitebox
-            import tempfile
+            from pysheds.grid import Grid
 
-            print("[run_hf] TCA: using WhiteboxTools", file=sys.stderr)
-            wbt = whitebox.WhiteboxTools()
-            wbt.verbose = False
+            print("[run_hf] TCA: using pysheds D8 flow accumulation", file=sys.stderr)
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                dem_in   = os.path.join(tmpdir, "dem.tif")
-                filled   = os.path.join(tmpdir, "filled.tif")
-                fdir_out = os.path.join(tmpdir, "fdir.tif")
-                acc_out  = os.path.join(tmpdir, "acc.tif")
-                _write_tif(dem, dem_in)
-                wbt.fill_depressions(dem_in, filled)
-                wbt.d8_pointer(filled, fdir_out)
-                wbt.d8_flow_accumulation(fdir_out, acc_out, out_type="cells")
-                with rasterio.open(acc_out) as src:
-                    tca_raw = src.read(1).astype(np.float32)
+                dem_path_tmp = os.path.join(tmpdir, "dem.tif")
+                _write_tif_working(tca_dem, dem_path_tmp)
+                grid = Grid.from_raster(dem_path_tmp)
+                dem_data   = grid.read_raster(dem_path_tmp)
+                pit_filled = grid.fill_pits(dem_data)
+                del dem_data
+                gc.collect()
+                flooded  = grid.fill_depressions(pit_filled)
+                del pit_filled
+                gc.collect()
+                inflated = grid.resolve_flats(flooded)
+                del flooded
+                gc.collect()
+                fdir     = grid.flowdir(inflated)
+                del inflated
+                gc.collect()
+                acc = grid.accumulation(fdir).astype(np.float32)
+                del fdir
+                gc.collect()
+                tca_raw_work = acc
 
         except ImportError:
-            print("[run_hf] TCA: whitebox not found, using synthetic TCA", file=sys.stderr)
+            print("[run_hf] TCA: pysheds not found, trying whitebox", file=sys.stderr)
 
-    # ── Synthetic TCA fallback ───────────────────────────────────────────────
-    if tca_raw is None:
-        print("[run_hf] TCA: generating synthetic flow accumulation from DEM gradient",
-              file=sys.stderr)
-        from scipy.ndimage import gaussian_filter
-        smoothed = gaussian_filter(dem.astype(np.float64), sigma=2)
-        dy, dx = np.gradient(smoothed)
-        slope_mag = np.sqrt(dx**2 + dy**2) + 1e-6
-        inverted = 1.0 / slope_mag
-        cumulative = np.cumsum(np.cumsum(inverted, axis=0), axis=1)
-        tca_raw = (cumulative / cumulative.max() * 1e6).astype(np.float32)
+        # ── Try whitebox ──────────────────────────────────────────────────────
+        if tca_raw_work is None:
+            try:
+                import whitebox
 
-    _write_tif(tca_raw, tca_raw_path)
+                print("[run_hf] TCA: using WhiteboxTools", file=sys.stderr)
+                wbt = whitebox.WhiteboxTools()
+                wbt.verbose = False
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    dem_in   = os.path.join(tmpdir, "dem.tif")
+                    filled   = os.path.join(tmpdir, "filled.tif")
+                    fdir_out = os.path.join(tmpdir, "fdir.tif")
+                    acc_out  = os.path.join(tmpdir, "acc.tif")
+                    _write_tif_working(tca_dem, dem_in)
+                    wbt.fill_depressions(dem_in, filled)
+                    wbt.d8_pointer(filled, fdir_out)
+                    wbt.d8_flow_accumulation(fdir_out, acc_out, out_type="cells")
+                    with rasterio.open(acc_out) as src:
+                        tca_raw_work = src.read(1).astype(np.float32)
+
+            except ImportError:
+                print("[run_hf] TCA: whitebox not found, using synthetic TCA", file=sys.stderr)
+
+        # ── Synthetic TCA fallback ────────────────────────────────────────────
+        if tca_raw_work is None:
+            print(
+                "[run_hf] TCA: generating synthetic flow accumulation from DEM gradient",
+                file=sys.stderr,
+            )
+            from scipy.ndimage import gaussian_filter
+            smoothed  = gaussian_filter(tca_dem.astype(np.float64), sigma=2)
+            dy, dx    = np.gradient(smoothed)
+            del smoothed
+            slope_mag = np.sqrt(dx**2 + dy**2) + 1e-6
+            del dx, dy
+            inverted  = 1.0 / slope_mag
+            del slope_mag
+            cumulative = np.cumsum(np.cumsum(inverted, axis=0), axis=1)
+            del inverted
+            tca_raw_work = (cumulative / cumulative.max() * 1e6).astype(np.float32)
+            del cumulative
+            gc.collect()
+
+    finally:
+        stop_hb.set()
+
+    # Free decimated DEM
+    del tca_dem
+    gc.collect()
+
+    # ── Upsample back to full grid if we decimated ────────────────────────────
+    if decimated:
+        print(
+            f"[run_hf] TCA: upsampling result from {tca_cols}x{tca_rows} "
+            f"back to {ncols}x{nrows}",
+            file=sys.stderr,
+        )
+        row_up = nrows / tca_rows
+        col_up = ncols / tca_cols
+        tca_raw = ndimage_zoom(tca_raw_work.astype(np.float64), (row_up, col_up), order=1).astype(np.float32)
+        del tca_raw_work
+        gc.collect()
+    else:
+        tca_raw = tca_raw_work
+        del tca_raw_work
+
+    _write_tif_full(tca_raw, tca_raw_path)
     print(f"[run_hf] TCA raw written → {tca_raw_path}", file=sys.stderr)
 
-    # Log-normalise TCA 0–1
+    # ── Log-normalise TCA 0–1 ─────────────────────────────────────────────────
     valid_mask = np.isfinite(tca_raw) & (tca_raw >= 0)
-    tca_log = np.where(valid_mask, np.log10(tca_raw + 1), np.nan).astype(np.float64)
-    valid_log = np.isfinite(tca_log)
+    tca_log    = np.where(valid_mask, np.log10(tca_raw + 1), np.nan).astype(np.float64)
+    valid_log  = np.isfinite(tca_log)
     if valid_log.any():
         mn = tca_log[valid_log].min()
         mx = tca_log[valid_log].max()
@@ -781,27 +896,34 @@ def run_tca_pipeline(dem, grid_transform, utm_crs, ncols, nrows, out_dir, code):
             tca_norm = np.where(valid_log, 0.5, np.nan).astype(np.float32)
     else:
         tca_norm = np.full((nrows, ncols), np.nan, dtype=np.float32)
+    del tca_log, valid_log
+    gc.collect()
 
-    _write_tif(tca_norm, tca_norm_path)
+    _write_tif_full(tca_norm, tca_norm_path)
     print(f"[run_hf] TCA normalised written → {tca_norm_path}", file=sys.stderr)
 
+    # ── RRZ / NRZ bands ───────────────────────────────────────────────────────
     valid_vals = tca_raw[np.isfinite(tca_raw) & (tca_raw >= 0)]
     if valid_vals.size > 0:
         p60 = float(np.percentile(valid_vals, 60))
         p80 = float(np.percentile(valid_vals, 80))
     else:
         p60, p80 = 0.0, 0.0
+    del valid_vals
 
     rrz = np.where((tca_raw >= p80) & np.isfinite(tca_raw), 1.0, np.nan).astype(np.float32)
-    _write_tif(rrz, tca_rrz_path, nodata=float("nan"))
+    _write_tif_full(rrz, tca_rrz_path, nodata=float("nan"))
+    del rrz
     print(f"[run_hf] TCA RRZ written (P80={p80:.1f}) → {tca_rrz_path}", file=sys.stderr)
 
     nrz = np.where(
         (tca_raw >= p60) & (tca_raw < p80) & np.isfinite(tca_raw), 1.0, np.nan
     ).astype(np.float32)
-    _write_tif(nrz, tca_nrz_path, nodata=float("nan"))
+    _write_tif_full(nrz, tca_nrz_path, nodata=float("nan"))
+    del nrz
     print(f"[run_hf] TCA NRZ written (P60={p60:.1f}) → {tca_nrz_path}", file=sys.stderr)
 
+    gc.collect()
     return tca_raw, tca_norm, p60, p80
 
 
@@ -852,6 +974,12 @@ def compute_hf(geology_norm, soil_norm, tca_norm, weights, grid_transform, utm_c
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
 def main():
+    # ── 0. CLI flags ─────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(description="Water Favorability pipeline")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Create empty placeholder .tif files and exit OK (no real computation)")
+    args, _ = parser.parse_known_args()   # ignore unknown args (e.g. from Render)
+
     # ── 1. Read config from stdin ────────────────────────────────────────────
     raw = sys.stdin.read().strip()
     if not raw:
@@ -874,6 +1002,73 @@ def main():
     utm_crs_override = cfg.get("utmCrs", None)  # optional; falls back to computed value if absent
 
     res_m = RES_M.get(resolution, 90)
+
+    # ── DRY-RUN: write zero-filled placeholders and exit immediately ───────────
+    if args.dry_run:
+        print("[run_hf] --dry-run active: skipping all real computation", file=sys.stderr)
+        out_dir = os.path.join(outputs_dir, code)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Minimal grid so rasterio is happy
+        _ncols, _nrows = 4, 4
+        _transform = rasterio.transform.from_bounds(0, 0, 1, 1, _ncols, _nrows)
+        _crs = CRS.from_epsg(32637)  # arbitrary – just for placeholder validity
+        _profile = {
+            "driver": "GTiff", "dtype": "float32",
+            "width": _ncols, "height": _nrows, "count": 1,
+            "crs": _crs, "transform": _transform,
+            "nodata": float("nan"), "compress": "lzw",
+        }
+        _placeholder_layers = [
+            f"{code}_HF_dem.tif",
+            f"{code}_HF_geologyPerm.tif",
+            f"{code}_HF_soilPerm.tif",
+            f"{code}_HF_tca_raw.tif",
+            f"{code}_HF_tca_norm.tif",
+            f"{code}_HF_tca_rrz.tif",
+            f"{code}_HF_tca_nrz.tif",
+            f"{code}_HF_hydroFavor.tif",
+        ]
+        for _fname in _placeholder_layers:
+            _fpath = os.path.join(out_dir, _fname)
+            print(f"[run_hf] dry-run: writing placeholder {_fname}", file=sys.stderr)
+            with rasterio.open(_fpath, "w", **_profile) as _dst:
+                _dst.write(np.zeros((_nrows, _ncols), dtype=np.float32), 1)
+
+        # Weights CSV
+        _csv = os.path.join(out_dir, f"{code}_HF_weights_matrix.csv")
+        with open(_csv, "w") as _f:
+            _f.write("layer,weight\n")
+            for _k in ("geology", "soil", "tca"):
+                _f.write(f"{_k},{weights.get(_k, 1.0)}\n")
+        print(f"[run_hf] dry-run: weights matrix written", file=sys.stderr)
+
+        # Metadata JSON
+        _meta = {
+            "projectName": project_name, "projectCode": code,
+            "dryRun": True, "createdAt": datetime.utcnow().isoformat() + "Z",
+            "aoi": aoi, "resolution": resolution,
+        }
+        _meta_path = os.path.join(out_dir, f"{code}_HF_metadata.json")
+        with open(_meta_path, "w") as _f:
+            json.dump(_meta, _f, indent=2)
+        print(f"[run_hf] dry-run: metadata JSON written", file=sys.stderr)
+
+        # ZIP
+        _zip_name = f"{code}_HF_outputs_{resolution}.zip"
+        _zip_path = os.path.join(outputs_dir, _zip_name)
+        with zipfile.ZipFile(_zip_path, "w", zipfile.ZIP_DEFLATED) as _zf:
+            for _fname in _placeholder_layers + [
+                f"{code}_HF_weights_matrix.csv",
+                f"{code}_HF_metadata.json",
+            ]:
+                _fp = os.path.join(out_dir, _fname)
+                if os.path.isfile(_fp):
+                    _zf.write(_fp, _fname)
+        print(f"[run_hf] dry-run: zip written -> {_zip_path}", file=sys.stderr)
+        print(f"OK:{code}:{resolution}:{_zip_path}", flush=True)
+        sys.exit(0)
+    # ── END DRY-RUN ────────────────────────────────────────────────────────────
 
     minLat = float(aoi.get("minLat", 0))
     maxLat = float(aoi.get("maxLat", 1))
@@ -944,6 +1139,10 @@ def main():
     soil_norm = load_or_synthesise_soil_perm(
         aoi, utm_crs, grid_transform, ncols, nrows, soil_out, data_sources
     )
+
+    # Free intermediate arrays before the memory-intensive TCA step
+    gc.collect()
+    print("[run_hf] Memory freed before TCA (gc.collect)", file=sys.stderr)
 
     # ── 8. TCA, RRZ, NRZ ────────────────────────────────────────────────────
     tca_raw, tca_norm, p60, p80 = run_tca_pipeline(
