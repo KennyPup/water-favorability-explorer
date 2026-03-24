@@ -70,20 +70,29 @@ const LAYER_LABELS: Array<{ key: keyof HfLayerUrls; label: string; ext: string }
 
 // ─── Form schema ──────────────────────────────────────────────────────────────
 //
-// z.coerce.number() handles ALL input sources cleanly:
-//  - Typed strings ("1.5", ".5") → coerced to number
-//  - JS numbers from defaultValues (1.0) → pass through unchanged
-// The z.union+transform+pipe chain proved unreliable with zodResolver because
-// zodResolver calls parse() against the raw field value which may be a JS
-// number from defaultValues – z.string() would immediately reject it.
+// Weight fields accept BOTH string (typed by user) AND number (from defaultValues /
+// programmatic reset). z.string() alone hard-rejects JS numbers, causing the
+// "Expected string, received number" / "Required" errors on untouched fields.
 //
+// z.union([z.string(), z.number()]) → trim → normalise leading decimal → coerce
+// covers every realistic input source without any special register() tricks.
+//
+const _weightField = z
+  .union([z.string(), z.number()])
+  .transform(v => {
+    const s = String(v).trim();
+    return s.startsWith(".") ? "0" + s : s;
+  })
+  .pipe(z.coerce.number().positive("Must be > 0"));
+
 const formSchema = z.object({
   projectName: z.string().min(1, "Required"),
+  // .trim() so accidental leading/trailing spaces don't break the regex
   projectCode: z.string().trim().min(2, "Min 2 letters").max(3, "Max 3 letters").regex(/^[A-Za-z]+$/, "Letters only (2–3)"),
   resolution:  z.enum(["30m", "90m", "1km"]),
-  wGeology:    z.coerce.number().positive("Must be > 0"),
-  wSoil:       z.coerce.number().positive("Must be > 0"),
-  wTca:        z.coerce.number().positive("Must be > 0"),
+  wGeology:    _weightField,
+  wSoil:       _weightField,
+  wTca:        _weightField,
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -91,28 +100,14 @@ type FormValues = z.infer<typeof formSchema>;
 function Label({ htmlFor, children }: { htmlFor: string; children: React.ReactNode }) {
   return <label htmlFor={htmlFor} className="block text-[11px] font-medium text-muted-foreground mb-0.5">{children}</label>;
 }
-// FInput must forward the ref so React Hook Form can attach its ref to the
-// actual <input> element. Without forwardRef the RHF ref lands on the <div>
-// wrapper and the field value is never read, causing permanent "Required".
-const FInput = React.forwardRef<
-  HTMLInputElement,
-  React.InputHTMLAttributes<HTMLInputElement> & { id: string; error?: string }
->(({ id, error, className, ...p }, ref) => (
-  <div>
-    <input
-      ref={ref}
-      id={id}
-      className={cn(
-        "w-full rounded border bg-input px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring",
-        error ? "border-destructive" : "border-border",
-        className,
-      )}
-      {...p}
-    />
-    {error && <p className="mt-0.5 text-[10px] text-destructive">{error}</p>}
-  </div>
-));
-FInput.displayName = "FInput";
+function FInput({ id, error, className, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { id: string; error?: string }) {
+  return (
+    <div>
+      <input id={id} className={cn("w-full rounded border bg-input px-2 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring", error ? "border-destructive" : "border-border", className)} {...p} />
+      {error && <p className="mt-0.5 text-[10px] text-destructive">{error}</p>}
+    </div>
+  );
+}
 function SecHead({ children }: { children: React.ReactNode }) {
   return <h3 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground mb-1.5 mt-3.5 first:mt-0 border-b border-border pb-0.5">{children}</h3>;
 }
@@ -156,8 +151,7 @@ export default function HFExplorer() {
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    mode: "onChange",
-    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: 1, wSoil: 1, wTca: 1 },
+    defaultValues: { projectName: "HF Run", projectCode: "HF", resolution: "90m", wGeology: "1", wSoil: "1", wTca: "1" },
   });
 
   useEffect(() => {
@@ -458,7 +452,6 @@ export default function HFExplorer() {
 
   // ── Run HF pipeline ───────────────────────────────────────────────────────
   async function onSubmit(values: FormValues) {
-    console.log("[HF] Form submitted – values:", values);
     if (!aoi) { toast({ title: "No AOI", description: "Draw a rectangle on the map first.", variant: "destructive" }); return; }
     setRunning(true);
     setRunStatus("running");
@@ -627,7 +620,7 @@ export default function HFExplorer() {
               <div>
                 <Label htmlFor="projectCode">Code (2–3 letters)</Label>
                 <FInput id="projectCode" placeholder="SHB" maxLength={3} className="uppercase" error={errors.projectCode?.message}
-                  {...register("projectCode")} />
+                  {...register("projectCode", { setValueAs: (v: string) => v.toUpperCase() })} />
               </div>
             </div>
 
@@ -661,8 +654,7 @@ export default function HFExplorer() {
               {(["wGeology","wSoil","wTca"] as const).map((k, i) => (
                 <div key={k}>
                   <Label htmlFor={k}>{["Geo","Soil","TCA"][i]}</Label>
-                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message}
-                    {...register(k, { valueAsNumber: true })} />
+                  <FInput id={k} type="text" inputMode="decimal" error={errors[k]?.message} {...register(k)} />
                 </div>
               ))}
             </div>
