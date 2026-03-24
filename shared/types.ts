@@ -70,3 +70,33 @@ export interface HfRunResponse {
   /** PNG URL for the TCA (log-normalised flow accumulation) map overlay */
   tcaPreviewUrl?: string;
 }
+
+// ─── Async job types ──────────────────────────────────────────────────────────
+
+export type JobStatus = "queued" | "running" | "ok" | "error";
+
+export interface HfJob {
+  jobId:       string;
+  status:      JobStatus;
+  projectCode: string;
+  resolution:  string;
+  utmCrs:      string;
+  estimatedPixels:      number;
+  estimatedOutputSizeMB: number;
+  aoi: { minLat: number; maxLat: number; minLon: number; maxLon: number };
+  /** Live stderr lines from Python (progress notes) */
+  logs:        string[];
+  startedAt:   string;
+  finishedAt?: string;
+  error?:      string;
+  /** Populated on success – mirrors HfRunResponse */
+  result?:     Omit<HfRunResponse, "status" | "error">;
+}
+
+export interface HfJobStatusResponse {
+  jobId:    string;
+  status:   JobStatus;
+  logs:     string[];
+  error?:   string;
+  result?:  Omit<HfRunResponse, "status" | "error">;
+}

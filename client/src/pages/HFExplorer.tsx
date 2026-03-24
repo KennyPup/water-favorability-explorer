@@ -16,7 +16,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { cn, formatNumber } from "@/lib/utils";
 import { toast } from "@/components/ui/toaster";
-import type { HfRunResponse, HfLayerUrls } from "@shared/types";
+import type { HfRunResponse, HfLayerUrls, HfJobStatusResponse } from "@shared/types";
 
 // Fix Leaflet default marker icons
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
@@ -149,9 +149,12 @@ export default function HFExplorer() {
   const [running,     setRunning]     = useState(false);
   const [runStatus,   setRunStatus]   = useState<"idle"|"running"|"ok"|"err">("idle");
   const [result,      setResult]      = useState<HfRunResponse|null>(null);
+  const [jobId,       setJobId]       = useState<string|null>(null);
+  const [jobLogs,     setJobLogs]     = useState<string[]>([]);
   const [downloading, setDownloading] = useState(false);
   const [hfLoading,   setHfLoading]   = useState(false);
   const [tcaLoading,  setTcaLoading]  = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval>|null>(null);
   const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
 
   const { register, handleSubmit, formState: { errors } } = useForm<FormValues>({
@@ -456,15 +459,58 @@ export default function HFExplorer() {
     }
   }, [searchText]);
 
-  // ── Run HF pipeline ───────────────────────────────────────────────────────
+  // ── Job polling ───────────────────────────────────────────────────────────
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  const startPolling = useCallback((id: string) => {
+    stopPolling();
+    pollRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`/api/hf/job/${id}`);
+        if (!res.ok) return;
+        const data: HfJobStatusResponse = await res.json();
+        setJobLogs(data.logs ?? []);
+
+        if (data.status === "ok" && data.result) {
+          stopPolling();
+          setRunning(false);
+          setRunStatus("ok");
+          const r: HfRunResponse = { status: "ok", ...data.result };
+          setResult(r);
+          toast({ title: "HF v1 complete", description: data.result.outputs?.zipName });
+          if (r.projectCode && r.resolution) {
+            await loadHfOverlay(r.projectCode, r.resolution);
+            if (r.tcaPreviewUrl) await loadTcaOverlay(r.projectCode, r.resolution);
+          }
+        } else if (data.status === "error") {
+          stopPolling();
+          setRunning(false);
+          setRunStatus("err");
+          setResult({ status: "error", error: data.error });
+          toast({ title: "Pipeline failed", description: data.error, variant: "destructive" });
+        }
+      } catch { /* network glitch – keep polling */ }
+    }, 3000);
+  }, [stopPolling, loadHfOverlay, loadTcaOverlay]);
+
+  // Clean up poll on unmount
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // ── Run HF pipeline (async) ───────────────────────────────────────────────
   async function onSubmit(values: FormValues) {
     console.log("[HF] Form submitted – values:", values);
     if (!aoi) { toast({ title: "No AOI", description: "Draw a rectangle on the map first.", variant: "destructive" }); return; }
+
     setRunning(true);
     setRunStatus("running");
     setResult(null);
+    setJobId(null);
+    setJobLogs([]);
+    stopPolling();
 
-    // Remove previous HF + TCA overlays
+    // Remove previous overlays
     if (hfOverlayRef.current && leafletMap.current) {
       leafletMap.current.removeLayer(hfOverlayRef.current);
       hfOverlayRef.current = null;
@@ -487,8 +533,6 @@ export default function HFExplorer() {
         }),
       });
 
-      // Guard: if the server returned HTML (e.g. a crash page), res.json() would
-      // throw "Unexpected token '<'". Detect it early and surface the real status.
       const contentType = res.headers.get("content-type") ?? "";
       if (!contentType.includes("application/json")) {
         const text = await res.text();
@@ -496,29 +540,25 @@ export default function HFExplorer() {
         throw new Error(`Server returned HTTP ${res.status} ${res.statusText} (not JSON). Check server logs.`);
       }
 
-      const data: HfRunResponse = await res.json();
+      const data = await res.json() as { status: string; jobId?: string; error?: string };
 
       if (!res.ok || data.status === "error") {
+        setRunning(false);
         setRunStatus("err");
-        toast({ title: "Pipeline failed", description: data.error, variant: "destructive" });
-      } else {
-        setRunStatus("ok");
-        toast({ title: "HF v1 complete", description: data.outputs?.zipName });
-        // Auto-load HF preview onto map
-        await loadHfOverlay(data.projectCode!, data.resolution!);
-        // Pre-render TCA PNG (loaded on demand when user moves slider)
-        if (data.tcaPreviewUrl) {
-          await loadTcaOverlay(data.projectCode!, data.resolution!);
-        }
+        setResult({ status: "error", error: data.error ?? "Unknown error" });
+        toast({ title: "Failed to start pipeline", description: data.error, variant: "destructive" });
+        return;
       }
-      setResult(data);
+
+      // Job queued – start polling
+      setJobId(data.jobId!);
+      startPolling(data.jobId!);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      setRunning(false);
       setRunStatus("err");
       setResult({ status: "error", error: msg });
       toast({ title: "Request failed", description: msg, variant: "destructive" });
-    } finally {
-      setRunning(false);
     }
   }
 
@@ -792,10 +832,37 @@ export default function HFExplorer() {
             <Pill v={runStatus === "ok" ? "ok" : runStatus === "err" ? "err" : runStatus === "running" ? "run" : "default"}>
               {{ idle: "Idle", running: "Running…", ok: "Complete", err: "Error" }[runStatus]}
             </Pill>
-            {result?.projectCode && <span className="font-mono text-xs">{result.projectCode}</span>}
+            {(result?.projectCode) && <span className="font-mono text-xs">{result.projectCode}</span>}
+            {jobId && runStatus === "running" && (
+              <span className="text-[9px] text-muted-foreground font-mono truncate" title={jobId}>job {jobId.slice(0,8)}…</span>
+            )}
           </div>
 
-          {/* UTM CRS – prominent */}
+          {/* Live progress log */}
+          {(runStatus === "running" || (runStatus !== "idle" && jobLogs.length > 0)) && (
+            <div className="mb-2 rounded border border-border/50 bg-black/30 px-2 py-1.5 max-h-44 overflow-y-auto">
+              <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-1">Progress log</p>
+              {jobLogs.length === 0
+                ? <p className="text-[10px] text-muted-foreground/60 italic">Waiting for pipeline…</p>
+                : jobLogs.map((line, i) => (
+                    <p key={i} className="text-[10px] font-mono text-green-300/80 leading-relaxed break-all">
+                      {line}
+                    </p>
+                  ))
+              }
+              {runStatus === "running" && (
+                <p className="text-[10px] text-blue-300/60 italic mt-0.5 flex items-center gap-1">
+                  <svg className="animate-spin h-2.5 w-2.5 shrink-0" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  Processing…
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* UTM CRS */}
           {result?.utmCrs && (
             <div className="rounded border border-[#22d3ee]/30 bg-[#22d3ee]/5 px-2.5 py-1.5 mb-2">
               <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">Target UTM CRS</p>
@@ -832,12 +899,22 @@ export default function HFExplorer() {
             </div>
           )}
 
-          {/* Download ZIP */}
+          {/* Download actions – shown on success */}
           {result?.status === "ok" && (
-            <button onClick={handleDownloadZip} disabled={downloading}
-              className="w-full rounded py-1.5 text-sm font-semibold bg-primary text-primary-foreground hover:bg-primary/80 disabled:opacity-50 disabled:cursor-not-allowed mb-3 transition-colors">
-              {downloading ? "Downloading…" : "⬇ Download all (ZIP)"}
-            </button>
+            <div className="space-y-1.5 mb-3">
+              <button onClick={handleDownloadZip} disabled={downloading}
+                className="w-full rounded py-1.5 text-sm font-semibold bg-primary text-primary-foreground hover:bg-primary/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+                {downloading ? "Downloading…" : "⬇ Download All Layers (.zip)"}
+              </button>
+              <button
+                onClick={() => {
+                  const url = result.layerUrls?.metadata;
+                  if (url) { const a = document.createElement("a"); a.href = url; a.click(); }
+                }}
+                className="w-full rounded py-1.5 text-sm font-semibold bg-secondary text-secondary-foreground hover:bg-accent transition-colors">
+                ↥ Export Metadata (.json)
+              </button>
+            </div>
           )}
 
           {/* Per-layer downloads */}
@@ -874,7 +951,7 @@ export default function HFExplorer() {
               <p>2. Enter project name and code.</p>
               <p>3. Choose resolution and weights.</p>
               <p>4. Click <strong className="text-foreground">Run HF v1</strong>.</p>
-              <p>5. The HF raster will appear on the map automatically.</p>
+              <p>5. The HF raster appears on the map automatically.</p>
               <p>6. Download the ZIP or individual layers.</p>
               <div className="mt-3 pt-2 border-t border-border/30 text-[10px]">
                 <p className="text-muted-foreground/70">Geology overlay = Macrostrat (visual context only). HF geology permeability is computed by the Python pipeline.</p>
