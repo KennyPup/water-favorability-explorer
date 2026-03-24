@@ -14,7 +14,7 @@
 
 import type { Express } from "express";
 import type { Server } from "http";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { z } from "zod";
@@ -107,6 +107,21 @@ function pythonScriptPath(): string {
   return candidates[0];
 }
 
+/**
+ * Resolve the correct Python executable.
+ * Render (and most Linux hosts) only have `python3`; some environments also
+ * expose `python`. We try python3 first, fall back to python.
+ */
+function pythonExecutable(): string {
+  for (const cmd of ["python3", "python"]) {
+    try {
+      execFileSync(cmd, ["--version"], { stdio: "ignore" });
+      return cmd;
+    } catch { /* not found, try next */ }
+  }
+  return "python3"; // final fallback – let spawn fail with a clear error
+}
+
 /** Build per-layer download URL map for the response */
 function buildLayerUrls(code: string, resolution: string): Record<string, string> {
   const urls: Record<string, string> = {};
@@ -169,12 +184,16 @@ export function registerRoutes(httpServer: Server, app: Express) {
       resolution,
       weights,
       outputsDir: OUTPUTS_DIR,
+      // Pass pre-computed UTM CRS so Python uses the same zone as the API response
+      utmCrs,
     };
 
     const script = pythonScriptPath();
     console.log(`[HF] Spawning ${script} for ${code} @ ${resolution}`);
 
-    const py = spawn("python3", [script], { timeout: 30 * 60 * 1000 });
+    const pythonCmd = pythonExecutable();
+    console.log(`[HF] Python executable: ${pythonCmd}`);
+    const py = spawn(pythonCmd, [script], { timeout: 30 * 60 * 1000 });
     let stdout = "", stderr = "";
     py.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
     py.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
